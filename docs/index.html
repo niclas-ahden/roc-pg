@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Redirecting...</title>
+        <!--
+            Relative redirect: this page is served at /<repo>/, so
+            "LATESTVERSION/" resolves to /<repo>/<version>/ without ever
+            naming the repo. The deploy-docs workflow substitutes
+            LATESTVERSION with the newest released version (or "main").
+        -->
+        <script>
+            window.location.href = "LATESTVERSION/";
+        </script>
+    </head>
+    <body>
+        <noscript>
+            <p>
+                If you are not automatically redirected, please
+                <a href="LATESTVERSION/">click here</a>.
+            </p>
+        </noscript>
+    </body>
+</html>

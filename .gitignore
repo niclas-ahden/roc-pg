@@ -11,3 +11,9 @@
 report.xml
 .envrc
 .direnv
+
+# Throwaway Postgres data dir created by tests.roc
+.pg-test-db/
+
+# roc docs output
+generated-docs/

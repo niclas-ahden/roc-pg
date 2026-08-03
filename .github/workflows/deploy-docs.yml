@@ -1,0 +1,30 @@
+name: Deploy docs to Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.roc'
+      - 'docs/index.html'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_run:
+    workflows: ["Bundle"]
+    types:
+      - completed
+
+  workflow_dispatch:
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # A Bundle that failed uploaded no docs, so there is nothing new to publish.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: niclas-ahden/roc-workflows/.github/workflows/deploy-docs.yml@v1

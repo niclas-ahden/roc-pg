@@ -1,7 +1,6 @@
 name: Bundle
 
 on:
-  # Run when a release is published
   release:
     types:
       - published
@@ -14,13 +13,65 @@ jobs:
       contents: write
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v3
-      - name: Install Roc
-        uses: hasnep/setup-roc@main
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
         with:
-          roc-version: nightly
-      - name: Bundle and release the library
-        uses: hasnep/bundle-roc-library@v0.1.0
+          # niclas-ahden.cachix.org serves the Roc compiler this flake pins,
+          # pushed there from a dev machine, so no runner builds it from
+          # source.
+          extra-conf: |
+            extra-substituters = https://niclas-ahden.cachix.org
+            extra-trusted-public-keys = niclas-ahden.cachix.org-1:FdGli1vBk0cTuVJV27Tau/JvlbW+Ly3pRwFByyqdke0=
+            accept-flake-config = true
+
+      - name: Cache Nix store
+        uses: nix-community/cache-nix-action@v7
         with:
-          library: src/main.roc
-          token: ${{ github.token }}
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          # Keep the saved store under GitHub's 10 GB/repo cache budget.
+          gc-max-store-size-linux: 5G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      # --max-jobs 0 forbids local builds, so a compiler that is missing from
+      # the binary cache is reported here instead of quietly costing the run
+      # half an hour. The plain build after it is the fallback that keeps a
+      # stale cache from failing the run outright.
+      - name: Build Roc from the flake
+        run: |
+          nix build .#roc --max-jobs 0 || {
+            echo "::warning::The pinned Roc compiler is not in the binary cache, so this run builds it from source. Push it from a machine that has it: nix build .#roc --no-link --print-out-paths | cachix push niclas-ahden"
+            nix build .#roc
+          }
+
+      - name: Bundle the library
+        working-directory: package
+        run: |
+          mkdir -p ../dist
+          "$GITHUB_WORKSPACE/result/bin/roc" bundle --output-dir ../dist main.roc
+
+      - name: Attach the bundle to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.tar.zst
+
+      # Freeze this version's docs as a release asset. deploy-docs.yml collects
+      # every release's docs.tar.gz to build the versioned docs site, so a
+      # version's docs live on its release, not in the repo.
+      - name: Generate docs
+        env:
+          ROC_DOCS_URL_ROOT: /${{ github.event.repository.name }}/${{ github.event.release.tag_name }}
+        run: ./result/bin/roc docs package/main.roc
+
+      - name: Package docs
+        run: tar -czf docs.tar.gz -C generated-docs .
+
+      - name: Attach the docs to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" docs.tar.gz
