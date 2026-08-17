@@ -27,4 +27,4 @@ jobs:
       contents: read
       pages: write
       id-token: write
-    uses: niclas-ahden/roc-workflows/.github/workflows/deploy-docs.yml@v1
+    uses: niclas-ahden/roc-workflows/.github/workflows/deploy-docs.yml@v2

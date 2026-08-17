@@ -8,4 +8,4 @@ on:
 
 jobs:
   test:
-    uses: niclas-ahden/roc-workflows/.github/workflows/test.yml@v1
+    uses: niclas-ahden/roc-workflows/.github/workflows/test.yml@v2
