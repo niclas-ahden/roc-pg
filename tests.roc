@@ -6,7 +6,7 @@
 ##
 ##     nix develop -c ./tests.roc
 app [main!] {
-	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.27.0/HZanbveSUDoJF8LypR663eH7PpaKEKG36eErEQzmV1Qs.tar.zst",
+	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.29.0/GrSTLEKd6yw8orQ5ByQQVY3Htg59vZYaoHBvQELueiMB.tar.zst",
 }
 
 import pf.Stdout
@@ -14,7 +14,7 @@ import pf.Cmd
 import pf.Env
 import pf.Path
 import pf.Utc
-import pf.OsStr exposing [OsStr]
+import pf.OsStr
 
 pg_port = "5499"
 
