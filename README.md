@@ -60,6 +60,7 @@ A `Client` is one connection. Its functions take the client first, so they read 
 - `client.query_one!(sql, params, decode_row)` decodes the one row, and fails with `EmptyResult` or `MultipleRows(n)` otherwise.
 - `client.query_optional!(sql, params, decode_row)` decodes the row if there is one: `Ok(row)` or `Err(NotFound)` inside the result, and `MultipleRows(n)` for more than one.
 - `client.execute!(sql, params)` runs `sql` for its effect and returns how many rows it affected.
+- `client.pipeline!(statements)` runs several statements, each `{ sql, params }`, in one round trip and returns how many rows each one affected. Outside a transaction they are one transaction of their own. A statement that fails skips the rest, none of them lands, and the error, `PgPipelineErr`, says which statement it was.
 - `client.batch_execute!(sql)` runs several statements separated by `;`, such as a migration, without parameters. The server splits them, and a statement that fails rolls the whole batch back.
 - `client.transaction!(|db| ...)` runs the body inside `begin`/`commit`, rolling back when the body fails. Called on the body's `db` it nests in a savepoint.
 - `client.command!(stmt)` runs a `Statement` (SQL or a prepared statement, with params) and returns the raw `PgResult`, for when the ones above don't fit.

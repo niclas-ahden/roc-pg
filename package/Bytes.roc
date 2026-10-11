@@ -7,7 +7,7 @@ Bytes :: [].{
 	# ---- Encoding ----
 
 	sequence : List(List(U8)) -> List(U8)
-	sequence = |parts| parts.fold([], |acc, part| acc.concat(part))
+	sequence = |parts| parts.join()
 
 	u8 : U8 -> List(U8)
 	u8 = |value| [value]

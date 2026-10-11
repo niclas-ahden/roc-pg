@@ -46,7 +46,8 @@
 ## platform's stream type, since this package never names platform types.
 ## Its functions take the client first, so they read as methods:
 ## `client.query!(sql, params, decode_row)`, `client.execute!(sql, params)`,
-## `client.batch_execute!(sql)`, `client.transaction!(|db| ...)`,
+## `client.pipeline!(statements)`, `client.batch_execute!(sql)`,
+## `client.transaction!(|db| ...)`,
 ## `client.command!(stmt)`,
 ## `client.prepare!(sql, { name })`, `client.close!()`. In an app signature
 ## the client is `Client.Client(Tcp.Stream)`, or
@@ -160,6 +161,11 @@ Client(stream) :: {
 	## [Client.CommandErr] plus `MultipleRows(n)`, for a query meant to
 	## return at most one row that returned more.
 	QueryOptionalErr(read, write, others) : Client.CommandErr(read, write, [MultipleRows(U64), ..others])
+
+	## [Client.CommandErr] plus `PgPipelineErr({ index, error })`: the server
+	## refused the statement at `index` (from 0) of a [Client.pipeline!], with
+	## `error` as for `PgErr`.
+	PipelineErr(read, write, others) : Client.CommandErr(read, write, [PgPipelineErr({ index : U64, error : Client.ServerError }), ..others])
 
 	## The errors [Client.transaction!] adds to those of its body: `begin` or
 	## `commit` failing with a [Client.CommandErr], the server refusing the
@@ -423,6 +429,77 @@ Client(stream) :: {
 	execute! = |client, sql, params| {
 		result = client.command!(Statement.new(sql).bind(params))?
 		Ok(PgResult.rows_affected(result))
+	}
+
+	## Run several statements, each with its own `$1` parameters, in one
+	## round trip, and return how many rows each one inserted, updated or
+	## deleted, in their order (see [Client.execute!]).
+	##
+	## ```
+	## [updated, _] = client.pipeline!([
+	##     { sql: "update users set seen = now() where id = $1", params: [Param.i64(id)] },
+	##     { sql: "delete from reminders where user_id = $1", params: [Param.i64(id)] },
+	## ])?
+	## ```
+	##
+	## The client writes every statement and then one Sync, and the server
+	## runs them in order, each one seeing what the ones before it did. Outside
+	## [Client.transaction!] the statements up to the Sync are one transaction
+	## of their own, so a pipeline is a transaction in one round trip. No
+	## statement can use what an earlier one returned, since all of them are
+	## sent before the first answer comes back: a write that depends on what
+	## is there decides in SQL, such as an `insert ... where not exists`.
+	##
+	## When a statement fails, the server skips the rest, and the pipeline
+	## fails with `PgPipelineErr({ index, error })`, the statement's place in
+	## the list (from 0) and the server's error. None of it lands then: inside
+	## [Client.transaction!] the transaction fails, and outside one its own
+	## transaction is rolled back. A commit that fails at the end, on a
+	## deferred constraint, is a `PgErr`.
+	##
+	## Rows a `select` returns are read and dropped. Since the client reads
+	## nothing until it has written everything, a pipeline is for writes and
+	## statements that return little: statements that return many rows can
+	## fill the server's send buffer while the client is still writing, and
+	## the two would wait for each other until the timeout. Use
+	## [Client.query!] for those. A pipeline without statements sends
+	## nothing.
+	pipeline! : Client(_), List({ sql : Str, params : List(Param.Param) }) => Try(List(U64), Client.PipelineErr(_, _, others))
+	pipeline! = |client, statements| {
+		if statements.is_empty() {
+			return Ok([])
+		}
+		for statement in statements {
+			check_no_nul(statement.sql, "sql")?
+		}
+		messages = statements.map(
+			|statement| {
+				{ format_codes, param_values } = Param.encode(statement.params)
+				Bytes.sequence(unnamed_messages(statement.sql, format_codes, param_values).drop_last(1))
+			},
+		)
+		write_all!(client, Bytes.sequence(messages.append(ProtoFrontend.sync)))?
+		var $counts = []
+		for _ in statements {
+			result =
+				match read_cmd_result!(client, [], []) {
+					Ok(answered) => answered
+					Err(PgErr(error)) => {
+						# The server skips to the Sync and answers ReadyForQuery, unless
+						# the error closed the connection (see drain_after_error!).
+						if !closes_connection(error) {
+							_ = read_ready_for_query!(client)?
+						}
+						return Err(PgPipelineErr({ index: $counts.len(), error }))
+					}
+					Err(other) => return Err(other)
+				}
+			$counts = $counts.append(PgResult.rows_affected(result))
+		}
+		match read_ready_for_query!(client)?.outcome {
+			NoError => Ok($counts)
+			SawError(error) => Err(PgErr(error))
+		}
 	}
 
 	## Run `sql`, which may hold several statements separated by `;`, like a
