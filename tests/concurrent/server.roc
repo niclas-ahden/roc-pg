@@ -10,15 +10,14 @@
 ## Its streams take no timeout, so the platform's `connect!` goes through
 ## `Client.fixed_timeout`.
 app [Context, program] {
-	pf: platform "https://github.com/niclas-ahden/basic-webserver/releases/download/0.18.0/DuwGgLMnPKEVKXR5KuwtZRAtgap8TSp4GTnFf8ANHtXB.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.18.0/9VgbC77zLmYYgxLpiNGCq3eySyRCbE2RriAM4sjr2y81.tar.zst",
 	pg: "../../package/main.roc",
-	http: "https://github.com/roc-lang/http/releases/download/1.0.0/6ZUwqYhCS8PU9Mo6MF7oV82ET2o7KYb57CLKDq4cq4sS.tar.zst",
+	http: "https://github.com/roc-lang/http/releases/download/2.0.0/6ZUwqYhCS8PU9Mo6MF7oV82ET2o7KYb57CLKDq4cq4sS.tar.zst",
 }
 
 import pf.Env
 import pf.Server
 import pf.Tcp
-import pf.Random
 import http.Response
 import pg.Client
 import pg.Param
@@ -57,7 +56,9 @@ respond! = |request, context| {
 echo! = |{ host, port, user, database }, number| {
 	client = Client.connect!({
 		connect!: Client.fixed_timeout(Tcp.connect!),
-		random_u64!: Random.seed_u64!,
+		# basic-webserver has no random numbers, which only a SCRAM login
+		# needs, and this test logs in with trust.
+		random_u64!: || Err(NoRandom),
 		host,
 		port,
 		user,

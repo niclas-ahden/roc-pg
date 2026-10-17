@@ -13,7 +13,7 @@
 ## are the same text. Where libpg_query itself parts from the server, the
 ## statement counts apart, with the reason ([libpg_query_differs]).
 app [main!] {
-	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.28.0/AP9SGT1yrhCKcFxKcoA5tBkNCM6ibBjBxcQGMTb6krev.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
 	pg: "../package/main.roc",
 }
 

@@ -7,7 +7,7 @@
 ##
 ##     nix develop -c ./tests.roc
 app [main!] {
-	pf: platform "https://github.com/niclas-ahden/basic-cli/releases/download/0.28.0/AP9SGT1yrhCKcFxKcoA5tBkNCM6ibBjBxcQGMTb6krev.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
 }
 
 import pf.Stdout
@@ -183,11 +183,11 @@ concurrent! = |{}| {
 			])
 			.stdout(Null)
 			.stderr(Null)
-			.spawn_leashed!()
+			.spawn!()
 			.map_err(|_| ConcurrentServerDidNotStart)?
 
 	outcome = concurrent_checks!({})
-	_ = server.kill!()
+	_ = server.close!()
 	outcome?
 	Stdout.line!("ok: ${concurrent_requests.to_str()} concurrent requests, ${concurrent_parallel.to_str()} at a time, a connection each")
 }
