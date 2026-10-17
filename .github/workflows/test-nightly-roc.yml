@@ -16,6 +16,8 @@ concurrency:
   group: nightly-roc
   cancel-in-progress: false
 
+# TODO: no Windows legs. suite-setup.sh adds PGBIN (C:/...) to PATH, whose
+# colon splits it, and tests.roc has never run on Windows.
 jobs:
   roc-versions:
     name: 'Required: look up the release and the latest Roc'
@@ -29,6 +31,7 @@ jobs:
     needs: roc-versions
     uses: niclas-ahden/roc-workflows/.github/workflows/suite.yml@v3
     with:
+      os: '["ubuntu-24.04", "macos-15"]'
       roc: ${{ needs.roc-versions.outputs.nightly }}
       label: roc-pg-insane-in-the-membrane ${{ needs.roc-versions.outputs.release }} on ${{ needs.roc-versions.outputs.nightly }}
       examples: ''
@@ -41,6 +44,7 @@ jobs:
     needs: roc-versions
     uses: niclas-ahden/roc-workflows/.github/workflows/suite.yml@v3
     with:
+      os: '["ubuntu-24.04", "macos-15"]'
       roc: ${{ needs.roc-versions.outputs.nightly }}
       label: roc-pg-insane-in-the-membrane ${{ needs.roc-versions.outputs.release }} on ${{ needs.roc-versions.outputs.nightly }}
       examples: ''

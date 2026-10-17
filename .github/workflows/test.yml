@@ -11,6 +11,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# TODO: no Windows legs. suite-setup.sh adds PGBIN (C:/...) to PATH, whose
+# colon splits it, and tests.roc has never run on Windows.
 jobs:
   # The release gate: roc check, roc test, the bundle sanity check and
   # ./tests.roc under the flake's compiler. tests.roc boots a throwaway
@@ -42,6 +44,7 @@ jobs:
     needs: roc-versions
     uses: niclas-ahden/roc-workflows/.github/workflows/suite.yml@v3
     with:
+      os: '["ubuntu-24.04", "macos-15"]'
       roc: ${{ needs.roc-versions.outputs.nightly }}
       label: Tests
       examples: ''
