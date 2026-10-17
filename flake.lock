@@ -139,18 +139,18 @@
       },
       "locked": {
         "dir": "src",
-        "lastModified": 1792133971,
-        "narHash": "sha256-10/lA8l01C9+APEXyI8Lnhp73jc3M9x0SeUjw0WSQe4=",
+        "lastModified": 1792238411,
+        "narHash": "sha256-f9obQKtzLZO8N+RZRnXFfuxPugLiRXD3ysBLbSCC4FI=",
         "owner": "roc-lang",
         "repo": "roc",
-        "rev": "7d7b432ae810e4747d06e43e32b50c98e84bf80a",
+        "rev": "5f126ac3ce5dd3c52d4d3309d5dcf53c5f7ffed5",
         "type": "github"
       },
       "original": {
         "dir": "src",
         "owner": "roc-lang",
         "repo": "roc",
-        "rev": "7d7b432ae810e4747d06e43e32b50c98e84bf80a",
+        "rev": "5f126ac3ce5dd3c52d4d3309d5dcf53c5f7ffed5",
         "type": "github"
       }
     },
