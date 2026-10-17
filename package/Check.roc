@@ -283,37 +283,93 @@ select_stmt = |s, env| {
 	{ ..result, problems: with_problems.concat(result.problems) }
 }
 
-## Selects joined by `union`, `intersect` or `except`. The columns are named
-## after the first one, and can be NULL when they can in any of them.
+## Selects joined by `union`, `intersect` or `except`, read a pair at a
+## time as Postgres's `transformSetOperationTree` reads them. The columns
+## are named after the left one's and take the type both share.
 set_operation : Node.SelectStmt, Env -> Check.Result
 set_operation = |s, env| {
-	results = set_branches(s).map(|branch| select_stmt(branch, env))
-	problems = results.fold([], |acc, r| acc.concat(r.problems))
+	tree = set_tree(s, env)
 	outputs =
-		match results.first() {
-			Ok(first) =>
-				match first.outputs {
-					Known(list) => Known(list.map_with_index(|o, i| { ..o, nullable: merge_nullable(results.map(|r| output_at(r.outputs, i))) }))
-					Unknown => Unknown
-				}
-			Err(_) => Unknown
+		match tree.columns {
+			Known(columns) => Known(columns.map(|c| c.output))
+			Unknown => Unknown
 		}
-	{ outputs, problems }
+	{ outputs, problems: tree.problems }
 }
 
-set_branches : Node.SelectStmt -> List(Node.SelectStmt)
-set_branches = |s|
-	if s.op == Enums.setop_none {
-		[s]
-	} else {
-		branch_list(s.larg).concat(branch_list(s.rarg))
-	}
+## A column of one side of a set operation, and it as an argument for
+## picking the type both sides share.
+SetColumn : { output : Check.Output, arg : Overload.Arg }
 
-branch_list : Node -> List(Node.SelectStmt)
-branch_list = |node|
-	match node {
-		SelectStmt(inner) => set_branches(inner)
-		_ => []
+set_tree : Node.SelectStmt, Env -> { columns : [Known(List(SetColumn)), Unknown], problems : List(Str) }
+set_tree = |s, env|
+	if s.op == Enums.setop_none {
+		result = select_stmt(s, env)
+		# A string literal, NULL or a parameter in a branch has no type yet.
+		untyped =
+			s.target_list.map(
+				|target|
+					match target {
+						ResTarget({ val: ParamRef(_), .. }) => Bool.True
+						ResTarget({ val: AConst(c), .. }) =>
+							match c.val {
+								String(_) => Bool.True
+								_ => c.isnull
+							}
+						_ => Bool.False
+					},
+			)
+		stars = s.target_list.any(
+			|target|
+				match target {
+					ResTarget(t) => star_of(t.val).is_ok()
+					_ => Bool.False
+				},
+		)
+		columns =
+			match result.outputs {
+				Known(outputs) => Known(outputs.map_with_index(|o, i| { output: o, arg: if !stars and untyped.get(i) == Ok(Bool.True) Untyped else type_arg(o.type) }))
+				Unknown => Unknown
+			}
+		{ columns, problems: result.problems }
+	} else {
+		side = |node|
+			match node {
+				SelectStmt(inner) => set_tree(inner, env)
+				_ => { columns: Unknown, problems: [] }
+			}
+		left = side(s.larg)
+		right = side(s.rarg)
+		context = if s.op == Enums.setop_union "UNION" else if s.op == Enums.setop_intersect "INTERSECT" else "EXCEPT"
+		problems = left.problems.concat(right.problems)
+		match (left.columns, right.columns) {
+			(Known(l), Known(r)) =>
+				if l.len() != r.len() {
+					{ columns: Unknown, problems: problems.append("each ${context} query must have the same number of columns") }
+				} else {
+					pairs = List.map2(l, r, |a, b| (a, b)).map(
+						|(a, b)| {
+							shared = shared_type(context, [a.arg, b.arg], env)
+							# A row of an intersect is in both sides, and NULL only when it is
+							# in both. A row of an except is the left side's.
+							nullable =
+								if s.op == Enums.setop_union {
+									merge_nullable([a.output.nullable, b.output.nullable])
+								} else if s.op == Enums.setop_intersect {
+									if a.output.nullable == No or b.output.nullable == No No else merge_nullable([a.output.nullable, b.output.nullable])
+								} else {
+									a.output.nullable
+								}
+							{ column: { output: { name: a.output.name, type: shared.type, nullable }, arg: type_arg(shared.type) }, problems: shared.problems }
+						},
+					)
+					{ columns: Known(pairs.map(|p| p.column)), problems: problems.concat(pairs.fold([], |acc, p| acc.concat(p.problems))) }
+				}
+			(Known(l), Unknown) =>
+				# The other side could change each column's type and NULL.
+				{ columns: Known(l.map(|c| { output: { ..c.output, type: Unknown, nullable: Unknown }, arg: Unsure })), problems }
+			_ => { columns: Unknown, problems }
+		}
 	}
 
 ## `Yes` when any can be NULL, `No` when none can.
@@ -325,17 +381,6 @@ merge_nullable = |all|
 		No
 	} else {
 		Unknown
-	}
-
-output_at : Cols, U64 -> [Yes, No, Unknown]
-output_at = |outputs, i|
-	match outputs {
-		Known(list) =>
-			match list.get(i) {
-				Ok(o) => o.nullable
-				Err(_) => Unknown
-			}
-		Unknown => Unknown
 	}
 
 ## `values (...), ...`, whose columns are `column1`, `column2`, ...
@@ -350,20 +395,19 @@ values_select = |lists, env| {
 	)
 	cells = rows.map(|items| items.map(|item| typed(item, [], env)))
 	problems = cells.fold([], |acc, row| row.fold(acc, |inner, cell| inner.concat(cell.problems)))
-	outputs =
-		match cells.first() {
-			Ok(first) =>
-				Known(
-					first.map_with_index(
-						|cell, i| {
-							nullable = merge_nullable(cells.map(|row| row.get(i).map_ok(|other| other.output.nullable) ?? Unknown))
-							{ ..cell.output, name: "column${(i + 1).to_str()}", nullable }
-						},
-					),
-				)
-			Err(_) => Unknown
-		}
-	{ outputs, problems }
+	width = cells.first().map_ok(|row| row.len()) ?? 0
+	if cells.any(|row| row.len() != width) {
+		return { outputs: Unknown, problems: problems.append("VALUES lists must all be the same length") }
+	}
+	columns = (cells.first() ?? []).map_with_index(
+		|_, i| {
+			column = cells.keep_oks(|row| row.get(i))
+			shared = shared_type("VALUES", column.map(|cell| cell.arg), env)
+			{ output: { name: "column${(i + 1).to_str()}", type: shared.type, nullable: merge_nullable(column.map(|cell| cell.output.nullable)) }, problems: shared.problems }
+		},
+	)
+	outputs = if cells.is_empty() Unknown else Known(columns.map(|c| c.output))
+	{ outputs, problems: problems.concat(columns.fold([], |acc, c| acc.concat(c.problems))) }
 }
 
 simple_select : Node.SelectStmt, Env -> Check.Result
@@ -899,13 +943,15 @@ walk = |node, rels, env| {
 		SubLink(s) => sublink(s, rels, env)
 		CoalesceExpr(c) => {
 			args = subs(c.args)
-			outputs = args.map(|a| a.output)
-			over({ name: "coalesce", type: common_type(outputs), nullable: first_non_null(outputs) }, args)
+			shared = shared_type("COALESCE", args.map(|a| a.arg), env)
+			adding(over({ name: "coalesce", type: shared.type, nullable: first_non_null(args.map(|a| a.output)) }, args), shared.problems)
 		}
 		MinMaxExpr(m) => {
 			args = subs(m.args)
-			outputs = args.map(|a| a.output)
-			over({ name: if m.op == Enums.is_greatest "greatest" else "least", type: common_type(outputs), nullable: first_non_null(outputs) }, args)
+			greatest = m.op == Enums.is_greatest
+			name = if greatest "greatest" else "least"
+			shared = shared_type(if greatest "GREATEST" else "LEAST", args.map(|a| a.arg), env)
+			adding(over({ name, type: shared.type, nullable: first_non_null(args.map(|a| a.output)) }, args), shared.problems)
 		}
 		CaseExpr(c) => {
 			arms = c.args.map(
@@ -916,9 +962,12 @@ walk = |node, rels, env| {
 					},
 			)
 			otherwise = sub(c.defresult)
-			results = arms.keep_oks(|arm| arm.result).map(|r| r.output)
+			results = arms.keep_oks(|arm| arm.result)
 			default_output = if c.defresult == Null { ..unknown_output, nullable: Yes } else otherwise.output
-			all = results.append(default_output)
+			all = results.map(|r| r.output).append(default_output)
+			# The default comes first in picking the type, as in Postgres.
+			default_arg = if c.defresult == Null Untyped else otherwise.arg
+			shared = shared_type("CASE", [default_arg].concat(results.map(|r| r.arg)), env)
 			# A branch that reads a column that can be NULL may only run when it
 			# is not, as in `case when x is null then 0 else x end`. So only a
 			# bare NULL, or no `else`, makes the case NULL for sure.
@@ -931,9 +980,19 @@ walk = |node, rels, env| {
 					Unknown
 				}
 			children = [sub(c.arg)].concat(arms.fold([], |acc, arm| acc.append(arm.condition).concat(arm.result.map_ok(|r| [r]) ?? []))).append(otherwise)
-			over({ name: "case", type: common_type(all), nullable }, children)
+			adding(over({ name: "case", type: shared.type, nullable }, children), shared.problems)
 		}
-		AArrayExpr(a) => over({ ..unknown_output, name: "array", nullable: No }, subs(a.elements))
+		AArrayExpr(a) => {
+			elements = subs(a.elements)
+			shared = if elements.is_empty() { type: Unknown, problems: [] } else shared_type("ARRAY", elements.map(|e| e.arg), env)
+			# An array of arrays has more dimensions, not another type.
+			type =
+				match shared.type {
+					Known(t) => Known(if t.ends_with("[]") t else "${t}[]")
+					Unknown => Unknown
+				}
+			adding(over({ ..unknown_output, name: "array", type, nullable: No }, elements), shared.problems)
+		}
 		RowExpr(r) => over(row_output, subs(r.args))
 		AExpr(a) => operator(a, rels, env)
 		BoolExpr(b) => {
@@ -1013,15 +1072,22 @@ const_type = |val|
 		_ => Unknown
 	}
 
-## The type all of `outputs` share, leaving out bare NULLs.
-common_type : List(Check.Output) -> [Known(Str), Unknown]
-common_type = |outputs| {
-	typed_outputs = outputs.drop_if(|o| o.type == Unknown and o.nullable == Yes)
-	match typed_outputs.first() {
-		Ok(first) if typed_outputs.all(|o| o.type == first.type) => first.type
-		_ => Unknown
+## The type values must share in `context`, such as `CASE` or `UNION`, and
+## the server's refusal when they have none. See [Overload.common]. One
+## that does not convert is refused only when no extension could bring a
+## cast for it.
+shared_type : Str, List(Overload.Arg), Env -> { type : [Known(Str), Unknown], problems : List(Str) }
+shared_type = |context, args, env|
+	match Overload.common(args, env.enums) {
+		Ok(t) => { type: Known(t), problems: [] }
+		Err(Mismatch(a, b)) => { type: Unknown, problems: ["${context} types ${a} and ${b} cannot be matched"] }
+		Err(NoConversion(from, to)) => { type: Known(to), problems: if refuses_calls(env) ["${context} could not convert type ${from} to ${to}"] else [] }
+		Err(Unsure) => { type: Unknown, problems: [] }
 	}
-}
+
+## `value` with more problems of its own, before those under it.
+adding : Typed, List(Str) -> Typed
+adding = |value, problems| { ..value, problems: problems.concat(value.problems) }
 
 ## `coalesce`, `greatest` and `least` are NULL only when every argument is.
 first_non_null : List(Check.Output) -> [Yes, No, Unknown]
@@ -1093,7 +1159,7 @@ operator = |a, rels, env| {
 			}
 		}
 	value = over(output, operands)
-	own = operator_call_problems(a, lefts, rights, choice, env).concat(comparison_problems(a, rels, env)).concat(operator_param_problems(a, lefts, rights, choice, env))
+	own = operator_call_problems(a, lefts, rights, choice, env).concat(in_problems(a, lefts, rights, env)).concat(comparison_problems(a, rels, env)).concat(operator_param_problems(a, lefts, rights, choice, env))
 	{ ..value, problems: own.concat(value.problems) }
 }
 
@@ -1453,6 +1519,24 @@ operator_call_problems = |a, lefts, rights, choice, env|
 			}
 			_ => []
 		}
+	}
+
+## An item of `x in (...)` that no operator compares with `x`, as in
+## `text_col in (1, 2)`. The server compares them one by one when they
+## share no type.
+in_problems : Node.AExpr, List(Typed), List(Typed), Env -> List(Str)
+in_problems = |a, lefts, rights, env|
+	if !refuses_calls(env) or a.kind != Enums.aexpr_in {
+		[]
+	} else {
+		left = single_arg(lefts)
+		rights.keep_oks(
+			|item|
+				match Overload.operator(op_name(a), Infix(left), item.arg, env.enums) {
+					Err(NoMatch) | Err(NoSuchName) => Ok("operator `${arg_text(left)} ${op_name(a)} ${arg_text(item.arg)}` does not exist")
+					_ => Err(Fits)
+				},
+		)
 	}
 
 ## Problems of parameter `p` where `what` takes `type`: the server gives
@@ -2246,3 +2330,21 @@ expect outputs("insert into schools (id, name) values ($i, $n) returning old.nam
 expect outputs("update schools set name = $n where id = $i returning with (old as before) before.name as was, before.*") == ["was text", "id integer", "name text"]
 expect outputs("merge into schools o using students r on r.school_id = o.id when matched then update set name = r.name returning r.name as student") == ["student text"]
 expect outputs("merge into schools o using students r on r.school_id = o.id when not matched by source then delete returning r.name as student") == ["student text null"]
+
+# The type values share, as select_common_type picks it.
+expect outputs("select id from students union select 1.5") == ["id numeric"]
+expect outputs("select 'a' as x union select 'b'") == ["x text"]
+expect outputs("select id from students union all select school_id from students union select 2::bigint") == ["id bigint"]
+expect problems("select id from students union select name from students") == ["UNION types integer and text cannot be matched"]
+expect problems("select 1 union select 1, 2") == ["each UNION query must have the same number of columns"]
+expect outputs("select phone from students intersect select name from students") == ["phone text"]
+expect outputs("select phone from students except select name from students") == ["phone text null"]
+expect outputs("select case when id > 1 then 1 else 2.5 end as c, coalesce(school_id, 1.5) as d from students") == ["c numeric", "d numeric"]
+expect problems("select case when id > 1 then 1 else true end from students") == ["CASE types boolean and integer cannot be matched"]
+expect problems("select greatest(id, name), coalesce(phone, 1) from students") == ["GREATEST types integer and text cannot be matched", "COALESCE types text and integer cannot be matched"]
+expect outputs("select array[id, school_id] as a, array['x', name] as b, array[array[1, 2]] as m from students") == ["a integer[]", "b text[]", "m integer[]"]
+expect problems("select array[id, name] from students") == ["ARRAY types integer and text cannot be matched"]
+expect outputs("values (1, 'a'), (2.5, null)") == ["column1 numeric", "column2 text null"]
+expect problems("values (1), (2, 3)") == ["VALUES lists must all be the same length"]
+expect problems("values (1), ('x'), (true)") == ["VALUES types integer and boolean cannot be matched"]
+expect problems("select id from students where name in ('a', 1) and id not in (1, 2, $x) and id in (select school_id from students)") == ["operator `text = integer` does not exist"]

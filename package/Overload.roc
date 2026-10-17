@@ -78,6 +78,59 @@ Overload :: [].{
 		choose(candidates, args_known, enums, same_type)
 	}
 
+	## The type values of `args` share where they must be of one type, as in
+	## the columns of a `union` or `values`, the results of a `case`, the
+	## arguments of `coalesce`, `greatest` and `least` and the elements of an
+	## `array[...]`. It is Postgres's `select_common_type`: one type when all
+	## are of it, `text` when all are untyped literals, and otherwise the
+	## first known type, moved on to a later one that it converts to
+	## implicitly and not back, unless it is its category's preferred type.
+	## Then every value must convert to it implicitly.
+	##
+	## `Mismatch(a, b)` when two are of different categories, which the
+	## server refuses, `NoConversion(from, to)` when one does not convert, and
+	## `Unsure` when a type is one this does not know, such as a domain.
+	common : List(Overload.Arg), List(Str) -> Try(Str, [Mismatch(Str, Str), NoConversion(Str, Str), Unsure])
+	common = |args, enums| {
+		if args.any(|a| a == Unsure) {
+			return Err(Unsure)
+		}
+		known = args.keep_oks(
+			|a|
+				match a {
+					Known(t) => Ok(t)
+					_ => Err(Untyped)
+				},
+		)
+		first =
+			match known.first() {
+				Ok(t) => t
+				Err(_) => return Ok("text")
+			}
+		if args.all(|a| a == Known(first)) {
+			return Ok(first)
+		}
+		# A domain is taken as its base type, which this does not know.
+		if known.any(|t| !is_builtin_type(t, enums)) {
+			return Err(Unsure)
+		}
+		var $picked = first
+		for next in known.drop_first(1) {
+			if next != $picked {
+				if Overload.category(next, enums) != Overload.category($picked, enums) {
+					return Err(Mismatch($picked, next))
+				}
+				if !is_preferred($picked) and can_coerce($picked, next, enums) and !can_coerce(next, $picked, enums) {
+					$picked = next
+				}
+			}
+		}
+		match known.find_first(|t| !can_coerce(t, $picked, enums)) {
+			Ok(t) => Err(NoConversion(t, $picked))
+			Err(_) => Ok($picked)
+		}
+	}
+
 	## Whether a value of type `from` can be stored in a column of type `to`,
 	## as in an insert or `set col = value`: the types an implicit or an
 	## assignment cast leads to, and any string type, which takes the text of
@@ -594,3 +647,19 @@ expect !Overload.can_assign("text", "access_level", enums)
 expect !Overload.can_assign("boolean", "integer", enums)
 expect Overload.can_assign("integer[]", "bigint[]", enums)
 expect Overload.can_assign("citext", "integer", enums)
+
+# select_common_type: the first type, moved on to one it converts to.
+expect Overload.common([Known("integer"), Known("integer")], enums) == Ok("integer")
+expect Overload.common([Known("integer"), Known("bigint")], enums) == Ok("bigint")
+expect Overload.common([Known("bigint"), Known("integer")], enums) == Ok("bigint")
+expect Overload.common([Known("integer"), Known("numeric"), Known("bigint")], enums) == Ok("numeric")
+expect Overload.common([Known("integer"), Known("double precision"), Known("numeric")], enums) == Ok("double precision")
+expect Overload.common([Untyped, Known("integer")], enums) == Ok("integer")
+expect Overload.common([Untyped, Untyped], enums) == Ok("text")
+expect Overload.common([Known("character varying"), Known("text")], enums) == Ok("character varying")
+expect Overload.common([Known("text"), Known("character varying")], enums) == Ok("text")
+expect Overload.common([Known("integer"), Known("boolean")], enums) == Err(Mismatch("integer", "boolean"))
+expect Overload.common([Known("integer"), Known("text")], enums) == Err(Mismatch("integer", "text"))
+expect Overload.common([Known("integer"), Unsure], enums) == Err(Unsure)
+expect Overload.common([Known("some_domain"), Known("integer")], enums) == Err(Unsure)
+expect Overload.common([Known("timestamp without time zone"), Known("timestamp with time zone")], enums) == Ok("timestamp with time zone")
