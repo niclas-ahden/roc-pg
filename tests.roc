@@ -255,6 +255,8 @@ expected_errors = [
 	{ query: "count_field!", message: "column `n` is `bigint`, but its field is `I32`" },
 	{ query: "sum_field!", message: "column `total` is `bigint`, but its field is `I32`" },
 	{ query: "nested_field!", message: "a field of the row type is a record, which a result row cannot fill" },
+	{ query: "unproven_field!", message: "column `first` may be NULL as far as the query shows, so its field needs to be `Try(I32, [Null])`" },
+	{ query: "narrowing_field!", message: "column `small` is `integer`, but its field is `U8`" },
 	{ query: "inferred_row!", message: "the row has a field `name`, but the query returns no column by that name (it returns `id`)" },
 ]
 

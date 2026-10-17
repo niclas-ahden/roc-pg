@@ -155,7 +155,7 @@ test_runtime_checks! : Db => Try({}, _)
 test_runtime_checks! = |db| {
 	# An array subscript hides the type from the analysis, not from the
 	# server's description of the result.
-	total : Try(List({ total : I32 }), _)
+	total : Try(List({ total : Try(I32, [Null]) }), _)
 	total = db.query!("select (array[sum(age)])[1] as total from typed_people", {})
 	check(
 		"a column type that does not fit its field",
@@ -165,16 +165,10 @@ test_runtime_checks! = |db| {
 		},
 	)?
 
-	# An array subscript makes a NULL the analysis cannot see.
-	null_age : Try(List({ age : I32 }), _)
-	null_age = db.query!("select (array[nullif(age, 85)])[1] as age from typed_people where id = $id", { id: 2.I32 })
-	check(
-		"NULL in a field that does not take it",
-		match null_age {
-			Err(PgDecodeErr(_)) => Bool.True
-			_ => Bool.False
-		},
-	)?
+	# An array subscript can be NULL, which the field must take.
+	null_age : List({ age : Try(I32, [Null]) })
+	null_age = db.query!("select (array[nullif(age, 85)])[1] as age from typed_people where id = $id", { id: 2.I32 })?
+	check("NULL in a field that takes it", null_age == [{ age: Err(Null) }])?
 	# The server reports a domain's column as its base type, smallint here,
 	# which the build already saw fits the U8.
 	_ = db.execute!("insert into typed_pixels (red) values ($red)", { red: 200.U8 })?

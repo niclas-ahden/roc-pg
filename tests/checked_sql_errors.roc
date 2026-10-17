@@ -96,6 +96,12 @@ sum_field! = |db| db.query!("select sum(school_id) as total from students", {})
 nested_field! : Db => Try(List({ school : { id : I32 } }), _)
 nested_field! = |db| db.query!("select school_id from students", {})
 
+unproven_field! : Db => Try(List({ first : I32 }), _)
+unproven_field! = |db| db.query!("select (array[school_id])[1] as first from students", {})
+
+narrowing_field! : Db => Try(List({ small : U8 }), _)
+narrowing_field! = |db| db.query!("select school_id as small from students", {})
+
 # No annotation at all: the row type comes from the caller.
 inferred_row! = |db| db.query!("select id from students", {})
 
@@ -124,6 +130,8 @@ main! = |_args| {
 	_ = count_field!(db)?
 	_ = sum_field!(db)?
 	_ = nested_field!(db)?
+	_ = unproven_field!(db)?
+	_ = narrowing_field!(db)?
 	names : List({ name : Str })
 	names = inferred_row!(db)?
 	Stdout.line!(names.len().to_str())?

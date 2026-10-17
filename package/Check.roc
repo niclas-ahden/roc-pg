@@ -916,10 +916,24 @@ not_null_refs = |node| {
 	}
 }
 
+## The columns a `case` arm's condition tests for NULL, `x is null` or
+## several such joined by `or`, which the arms after it see as not NULL.
+null_tested : Node -> List(Node.ColumnRef)
+null_tested = |node|
+	match node {
+		NullTest({ arg: ColumnRef(c), nulltesttype, .. }) if nulltesttype == Enums.is_null => [c]
+		BoolExpr(b) if b.boolop == Enums.or_expr => b.args.fold([], |acc, arg| acc.concat(null_tested(arg)))
+		_ => []
+	}
+
 ## The relations with the columns `where` rules NULL out marked.
 narrowed : List(Rel), Node -> List(Rel)
-narrowed = |rels, where_clause|
-	not_null_refs(where_clause).fold(
+narrowed = |rels, where_clause| narrow_columns(rels, not_null_refs(where_clause))
+
+## The relations with `columns` marked as not NULL.
+narrow_columns : List(Rel), List(Node.ColumnRef) -> List(Rel)
+narrow_columns = |rels, columns|
+	columns.fold(
 		rels,
 		|acc, c|
 			match column_ref(c) {
@@ -1033,14 +1047,30 @@ walk = |node, rels, env| {
 			adding(over({ name, type: shared.type, nullable: first_non_null(args.map(|a| a.output)) }, args), shared.problems)
 		}
 		CaseExpr(c) => {
-			arms = c.args.map(
-				|arm|
-					match arm {
-						CaseWhen(w) => { condition: sub(w.expr), result: Ok(sub(w.result)) }
-						other => { condition: sub(other), result: Err(NotAnArm) }
-					},
-			)
-			otherwise = sub(c.defresult)
+			# An arm's result is only read for rows its condition keeps, and
+			# those the arms before it did not, as in
+			# `case when x is not null then x else 0 end` and
+			# `case when x is null then 0 else x end`.
+			searched = c.arg == Null
+			var $caught = []
+			var $arms = []
+			for arm in c.args {
+				match arm {
+					CaseWhen(w) => {
+						seen = narrow_columns(rels, $caught)
+						arm_rels = if searched narrowed(seen, w.expr) else seen
+						$arms = $arms.append({ condition: sub(w.expr), result: Ok(typed(w.result, arm_rels, env)) })
+						if searched {
+							$caught = $caught.concat(null_tested(w.expr))
+						}
+					}
+					other => {
+						$arms = $arms.append({ condition: sub(other), result: Err(NotAnArm) })
+					}
+				}
+			}
+			arms = $arms
+			otherwise = typed(c.defresult, narrow_columns(rels, $caught), env)
 			results = arms.keep_oks(|arm| arm.result)
 			default_output = if c.defresult == Null { ..unknown_output, nullable: Yes } else otherwise.output
 			all = results.map(|r| r.output).append(default_output)
@@ -1048,8 +1078,8 @@ walk = |node, rels, env| {
 			default_arg = if c.defresult == Null Untyped else otherwise.arg
 			shared = shared_type("CASE", [default_arg].concat(results.map(|r| r.arg)), env)
 			# A branch that reads a column that can be NULL may only run when it
-			# is not, as in `case when x is null then 0 else x end`. So only a
-			# bare NULL, or no `else`, makes the case NULL for sure.
+			# is not, in ways the conditions do not show. So only a bare NULL, or
+			# no `else`, makes the case NULL for sure.
 			nullable =
 				if all.all(|o| o.nullable == No) {
 					No
@@ -2293,7 +2323,7 @@ expect outputs("select * from students natural join schools") == ["id integer", 
 expect problems("select name as n from students order by n") == []
 expect problems("select r from students r") == []
 expect outputs("select greatest(id, school_id) as g, nullif(name, '') as n from students") == ["g integer", "n text null"]
-expect outputs("select case when phone is null then 'none' else phone end as p from students") == ["p text null?"]
+expect outputs("select case when phone is null then 'none' else phone end as p from students") == ["p text"]
 expect outputs("select case when id > 1 then name end as n from students") == ["n text null"]
 expect outputs("select array(select id from schools) as ids, current_date") == ["ids integer[]", "current_date date"]
 expect outputs("values (1, 'a'), (2, null)") == ["column1 integer", "column2 text null"]
@@ -2455,3 +2485,11 @@ expect outputs_in(schemas_catalog.with_search_path(["app"]), "select greet(email
 expect check_in(schemas_catalog, "select app.lower(name) from users").problems == ["function `lower` does not exist"]
 expect outputs_in(schemas_catalog, "select pg_catalog.lower(name) as l, total(id) as t from users") == ["l text", "t integer null?"]
 expect outputs_in(schemas_catalog, "select e.name from everyone() e") == ["name text null?"]
+
+# A case arm sees the columns its condition, or an earlier arm's `is null`,
+# rules NULL out.
+expect outputs("select case when phone is not null then 'x' || phone else 'none' end as p from students") == ["p text"]
+expect outputs("select case when phone is null then 'none' else phone end as p from students") == ["p text"]
+expect outputs("select case when phone is null or id > 1 then 'x' else phone end as p from students") == ["p text"]
+expect outputs("select case when id > 1 then phone else 'none' end as p from students") == ["p text null?"]
+expect outputs("select case when phone is null and id > 1 then 'none' else phone end as p from students") == ["p text null?"]

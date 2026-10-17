@@ -147,8 +147,14 @@ row_problem = |analysis, fields, catalog|
 							Known(type) if !Check.fits(catalog, type, field.kind) => return Err("column `${field.name}` is `${type}`, but its field is `${field.kind}`")
 							_ => {}
 						}
-						if output.nullable == Yes and !field.nullable {
-							return Err("column `${field.name}` can be NULL, so its field needs to be `Try(${field.kind}, [Null])`")
+						if !field.nullable {
+							match output.nullable {
+								Yes => return Err("column `${field.name}` can be NULL, so its field needs to be `Try(${field.kind}, [Null])`")
+								# Without a schema nothing is known to be NULL or not, which is
+								# then found when a row decodes.
+								Unknown if !catalog.is_none() => return Err("column `${field.name}` may be NULL as far as the query shows, so its field needs to be `Try(${field.kind}, [Null])`, or the query must show it is not, see \"Telling the checker more\" in the README")
+								_ => {}
+							}
 						}
 					}
 					_ => return Err("the query returns more than one column named `${field.name}`")
@@ -243,3 +249,8 @@ expect in_domains("select red + 1 as r from pixels", [], [field("r", "I32", Bool
 expect in_domains("update pixels set red = $red where big = $big", [field("red", "U8", Bool.False), field("big", "I32", Bool.False)], []) == Ok({})
 expect in_domains("update pixels set red = $red", [field("red", "I16", Bool.False)], []) == Err("column `red` is `u8`, but `$red` is `I16`")
 expect in_domains("update pixels set small = $s", [field("s", "I32", Bool.False)], []) == Err("column `small` is `smallint`, but `$s` is `I32`")
+
+# With a schema, a column the query does not show to be NOT NULL needs a
+# `Try` field.
+expect checked("select (array[id])[1] as x from students", [], [field("x", "I32", Bool.False)]) == Err("column `x` may be NULL as far as the query shows, so its field needs to be `Try(I32, [Null])`, or the query must show it is not, see \"Telling the checker more\" in the README")
+expect checked("select coalesce((array[id])[1], 0) as x from students", [], [field("x", "I32", Bool.False)]) == Ok({ text: "select coalesce((array[id])[1], 0) as x from students", params: [] })
