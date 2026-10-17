@@ -104,29 +104,36 @@ Catalog :: { dump : Dump }.{
 	## fields of the parameter record, and the result columns against the
 	## fields of the row type. `Sql` calls it while the app builds.
 	check : Catalog, Str, List(RowFormat.Field), List(RowFormat.Field) -> Try({ text : Str, params : List(Str), unverified : List(Str) }, Str)
-	check = |catalog, raw, param_fields, row_fields| {
-		dump = catalog.dump
-		toks = Lex.tokens(raw) ? |err| Lex.err_to_str(raw, err)
-		match toks.find_first(|t| is_positional(t.kind)) {
-			Ok(tok) => return Err("use `$name` placeholders named after the fields of the parameter record, not `${Lex.token_text(raw, tok)}` (at ${Lex.position(raw, tok.start)})")
-			Err(_) => {}
-		}
-		stmt = parse_one(raw, toks)?
-		{ text, names } = Lex.number_placeholders(raw, toks)
-		param_problem(names, param_fields.map(|f| f.name))?
-		result = Check.analyze(stmt, dump, param_fields, Lex.named_at(toks))
-		match result.problems {
-			[first, ..] => return Err(first)
-			[] => {}
-		}
-		row_problem(result.outputs, row_fields, dump)?
-		unverified =
-			match result.outputs {
-				Known(outputs) => row_fields.keep_if(|f| outputs.any(|o| o.name == f.name and o.type == Unknown)).map(|f| f.name)
-				Unknown => row_fields.map(|f| f.name)
-			}
-		Ok({ text, params: names, unverified })
+	check = |catalog, raw, param_fields, row_fields| check_query(catalog.dump, raw, param_fields, row_fields)
+}
+
+## The body of [Catalog.check]. It is a top-level function because the
+## method is reached through a `where` clause (`catalog.check` in [Sql]),
+## and the compiler never finds such a method in its specialization cache.
+## With the body in the method, a check after editing one query lowered the
+## whole checker again, ten times the work of the check itself.
+check_query : Dump, Str, List(RowFormat.Field), List(RowFormat.Field) -> Try({ text : Str, params : List(Str), unverified : List(Str) }, Str)
+check_query = |dump, raw, param_fields, row_fields| {
+	toks = Lex.tokens(raw) ? |err| Lex.err_to_str(raw, err)
+	match toks.find_first(|t| is_positional(t.kind)) {
+		Ok(tok) => return Err("use `$name` placeholders named after the fields of the parameter record, not `${Lex.token_text(raw, tok)}` (at ${Lex.position(raw, tok.start)})")
+		Err(_) => {}
 	}
+	stmt = parse_one(raw, toks)?
+	{ text, names } = Lex.number_placeholders(raw, toks)
+	param_problem(names, param_fields.map(|f| f.name))?
+	result = Check.analyze(stmt, dump, param_fields, Lex.named_at(toks))
+	match result.problems {
+		[first, ..] => return Err(first)
+		[] => {}
+	}
+	row_problem(result.outputs, row_fields, dump)?
+	unverified =
+		match result.outputs {
+			Known(outputs) => row_fields.keep_if(|f| outputs.any(|o| o.name == f.name and o.type == Unknown)).map(|f| f.name)
+			Unknown => row_fields.map(|f| f.name)
+		}
+	Ok({ text, params: names, unverified })
 }
 
 ## Run Postgres's grammar over `raw` and return the one statement's tree.

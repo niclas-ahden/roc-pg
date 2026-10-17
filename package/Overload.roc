@@ -149,7 +149,7 @@ Overload :: [].{
 		} else if Overload.category(to, enums) == 'S' {
 			Bool.True
 		} else {
-			can_coerce(from, to, enums) or lines_named(Builtins.casts, from).any(|fields| fields.get(1) == Ok(to))
+			can_coerce(from, to, enums) or has_line(Builtins.casts, [from, to])
 		}
 
 	## The category (`typcategory`) of a type: `A` for arrays, `E` for the
@@ -161,9 +161,9 @@ Overload :: [].{
 		} else if enums.contains(type) {
 			'E'
 		} else {
-			match lines_named(Builtins.types, type) {
-				[[_, cat, ..], ..] => cat.to_utf8().first() ?? 'U'
-				_ => 'U'
+			match type_field(type, 1) {
+				Ok(cat) => cat.first() ?? 'U'
+				Err(_) => 'U'
 			}
 		}
 }
@@ -189,7 +189,7 @@ is_builtin_type = |type, enums|
 	if type.ends_with("[]") {
 		is_builtin_type(type.drop_suffix("[]"), enums)
 	} else {
-		enums.contains(type) or !lines_named(Builtins.types, type).is_empty()
+		enums.contains(type) or type_field(type, 0).is_ok()
 	}
 
 ## A function as the catalogs declare it, before a call's arity picks how
@@ -278,16 +278,26 @@ operator_candidate = |name, fields, prefix|
 ## before the others, the operator rule for one side of no type.
 choose : List(Candidate), List(Overload.Arg), List(Str), List(Candidate) -> Try(Overload.Choice, Overload.Miss)
 choose = |candidates, args, enums, first| {
-	exact = candidates.keep_if(|c| exact_matches(c, args) == args.len())
-	viable = candidates.keep_if(|c| coercible(c, args, enums))
 	if args.any(|a| a == Unsure) {
 		# The server knows that type, and might pick any of these.
-		agreed(viable, args, enums)
-	} else if exact.len() == 1 {
-		pick(exact, args, enums)
-	} else if first.len() == 1 {
-		pick(first, args, enums)
-	} else if viable.is_empty() {
+		return agreed(candidates.keep_if(|c| coercible(c, args, enums)), args, enums)
+	}
+	exact = candidates.keep_if(|c| exact_matches(c, args) == args.len())
+	if exact.len() == 1 {
+		return pick(exact, args, enums)
+	}
+	if first.len() == 1 {
+		return pick(first, args, enums)
+	}
+	# Only now ask the casts table about every candidate, which an exact
+	# match, the common case, does not need.
+	choose_viable(candidates.keep_if(|c| coercible(c, args, enums)), args, enums)
+}
+
+## The rest of [choose], once neither an exact match nor `first` decides.
+choose_viable : List(Candidate), List(Overload.Arg), List(Str) -> Try(Overload.Choice, Overload.Miss)
+choose_viable = |viable, args, enums| {
+	if viable.is_empty() {
 		# Every argument is of a known type or of none, and no candidate takes them.
 		Err(NoMatch)
 	} else if viable.len() == 1 {
@@ -333,8 +343,9 @@ agreed = |candidates, args, enums|
 
 keep_most : List(Candidate), (Candidate -> U64) -> List(Candidate)
 keep_most = |candidates, score| {
-	best = candidates.fold(0, |acc, c| if score(c) > acc score(c) else acc)
-	candidates.keep_if(|c| score(c) == best)
+	scored = candidates.map(|c| (c, score(c)))
+	best = scored.fold(0, |acc, (_, s)| if s > acc s else acc)
+	scored.keep_if(|(_, s)| s == best).map(|(c, _)| c)
 }
 
 ## How many arguments are exactly of their parameter's type.
@@ -456,7 +467,7 @@ can_coerce = |from, to, enums|
 				if from.ends_with("[]") and to.ends_with("[]") {
 					can_coerce(from.drop_suffix("[]"), to.drop_suffix("[]"), enums)
 				} else {
-					lines_named(Builtins.casts, from).any(|fields| fields.get(1) == Ok(to) and fields.get(2) == Ok("i"))
+					has_line(Builtins.casts, [from, to, "i"])
 				}
 		}
 	}
@@ -523,17 +534,28 @@ one_binding = |bound|
 	}
 
 is_preferred : Str -> Bool
-is_preferred = |type|
-	match lines_named(Builtins.types, type) {
-		[[_, _, flags, ..], ..] => flags == "p"
-		_ => Bool.False
-	}
+is_preferred = |type| type_field(type, 2) == Ok(['p'])
 
-## The lines of `table` whose first field is `name`, split into fields. The
-## lines are sorted by their first field, so this is a binary search.
+## The lines of `table` whose first field is `name`, split into fields.
 lines_named : List(U8), Str -> List(List(Str))
 lines_named = |table, name| {
 	key = name.to_utf8()
+	var $out = []
+	var $at = first_line(table, key)
+	while $at < table.len() and compare_key(table, $at, key) == Same {
+		end = next_line(table, $at)
+		line = table.sublist({ start: $at, len: end - $at - 1 })
+		$out = $out.append(Str.split_on(Str.from_utf8_lossy(line), "\t"))
+		$at = end
+	}
+	$out
+}
+
+## The start of the first line of `table` whose first field is `key`, or
+## where it would be. The lines are sorted by their first field, so this is
+## a binary search.
+first_line : List(U8), List(U8) -> U64
+first_line = |table, key| {
 	var $lo = 0
 	var $hi = table.len()
 	while $lo < $hi {
@@ -544,15 +566,71 @@ lines_named = |table, name| {
 			$hi = start
 		}
 	}
-	var $out = []
-	var $at = $lo
+	$lo
+}
+
+## Whether `table` has a line whose first fields are `fields`, each one
+## matched whole. Unlike [lines_named] it splits no line, so a lookup costs
+## no allocation. Choosing an operator asks this for every candidate, and
+## splitting the lines made that most of the time a query took to check.
+has_line : List(U8), List(Str) -> Bool
+has_line = |table, fields| {
+	key = (fields.first() ?? "").to_utf8()
+	wanted = Str.join_with(fields, "\t").to_utf8()
+	var $at = first_line(table, key)
 	while $at < table.len() and compare_key(table, $at, key) == Same {
-		end = next_line(table, $at)
-		line = table.sublist({ start: $at, len: end - $at }).drop_if(|b| b == '\n')
-		$out = $out.append(Str.split_on(Str.from_utf8_lossy(line), "\t"))
-		$at = end
+		if starts_with_fields(table, $at, wanted) {
+			return Bool.True
+		}
+		$at = next_line(table, $at)
 	}
-	$out
+	Bool.False
+}
+
+## Whether the line at `start` begins with the fields in `wanted`, so that
+## a field ends right after them.
+starts_with_fields : List(U8), U64, List(U8) -> Bool
+starts_with_fields = |table, start, wanted| {
+	var $i = 0
+	while $i < wanted.len() {
+		if table.get(start + $i) != wanted.get($i) {
+			return Bool.False
+		}
+		$i = $i + 1
+	}
+	match table.get(start + wanted.len()) {
+		Ok(b) => b == '\t' or b == '\n'
+		Err(_) => Bool.True
+	}
+}
+
+## Field `n` of the line of `type` in [Builtins.types], read in place.
+type_field : Str, U64 -> Try(List(U8), [NotFound])
+type_field = |type, n| {
+	table = Builtins.types
+	key = type.to_utf8()
+	start = first_line(table, key)
+	if start >= table.len() or compare_key(table, start, key) != Same {
+		return Err(NotFound)
+	}
+	end = next_line(table, start)
+	var $from = start
+	var $field = 0
+	var $at = start
+	# Past the end of the table counts as the end of the line, so the last
+	# field of a last line without a newline ends too.
+	while $at < end {
+		b = table.get($at) ?? '\n'
+		if b == '\t' or b == '\n' {
+			if $field == n {
+				return Ok(table.sublist({ start: $from, len: $at - $from }))
+			}
+			$field = $field + 1
+			$from = $at + 1
+		}
+		$at = $at + 1
+	}
+	Err(NotFound)
 }
 
 ## The start of the line holding byte `i`.

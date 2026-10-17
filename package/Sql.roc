@@ -34,7 +34,7 @@
 ## row decodes into.
 import RowFormat
 
-Sql(schema, params, row) :: { text : Str, params : List(Str), unverified : List(Str) }.{
+Sql(schema, params, row) :: { text : Str, params : List(Str), unverified : List(Str), fields : List(RowFormat.Field) }.{
 	## The compiler calls this with the string literal. It reaches the
 	## checker through `schema`'s catalog, a [Catalog], whose `check` does
 	## the work. So a query run without being checked, or code that only
@@ -53,7 +53,7 @@ Sql(schema, params, row) :: { text : Str, params : List(Str), unverified : List(
 		param_fields = RowFormat.shape(Params.parser_for(RowFormat.Nulls), Params.parser_for(RowFormat.Kinds)) ? |_| BadQuotedBytes("a field of the parameter record is a record, which is no parameter")
 		row_fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| BadQuotedBytes("a field of the row type is a record, which a result row cannot fill")
 		match Schema.catalog({}).check(raw, param_fields, row_fields) {
-			Ok({ text, params: names, unverified }) => Ok(Sql.{ text, params: names, unverified })
+			Ok({ text, params: names, unverified }) => Ok(Sql.{ text, params: names, unverified, fields: row_fields })
 			Err(message) => Err(BadQuotedBytes(message))
 		}
 	}
@@ -71,5 +71,10 @@ Sql(schema, params, row) :: { text : Str, params : List(Str), unverified : List(
 	## which the query's result description is checked against when it runs.
 	unverified : Sql(schema, params, row) -> List(Str)
 	unverified = |sql| sql.unverified
+
+	## The fields of the row type as `from_quote` read them, so a query
+	## knows them without asking the row type again when it runs.
+	fields : Sql(schema, params, row) -> List(RowFormat.Field)
+	fields = |sql| sql.fields
 }
 

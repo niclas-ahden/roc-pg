@@ -243,31 +243,7 @@ Client(stream, schema) :: {
 	connect! : { connect! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms ?: U64, statement_timeout_ms ?: U64, params ?: List((Str, Str)), auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, others))
 	connect! = |{ connect!: dial!, random_u64!, host, port, user, database, auth, timeout_ms: given_timeout_ms, statement_timeout_ms, params, auth_methods }| {
 		statement_ms = statement_timeout_ms ?? 0
-		timeout_ms = given_timeout_ms ?? default_timeout_ms(statement_ms)
-		all_params = statement_timeout_params(statement_ms).concat(params ?? [])
-		# The startup message is a list of C strings, so a NUL byte in any of
-		# them would end it early and turn the rest into settings of its own.
-		for (name, _) in all_params {
-			if !is_session_setting(name) {
-				return Err(ParamNotAllowed(name))
-			}
-		}
-		check_no_nul(user, "user")?
-		check_no_nul(database, "database")?
-		for (name, value) in all_params {
-			check_no_nul(name, "a parameter name")?
-			check_no_nul(value, "parameter ${name}")?
-		}
-		match auth {
-			Password(password) => check_no_nul(password, "password")?
-			NoAuth => {}
-		}
-		stream =
-			match dial!(host, port, timeout_ms) {
-				Ok(s) => Ok(s)
-				Err(err) => Err(PgConnectErr(TcpConnectErr(err)))
-			}?
-		do_startup!(stream, { user, database, auth, timeout_ms, params: all_params, auth_methods: auth_methods ?? all_auth_methods, random_u64! })
+		connect_with!({ dial!, random_u64!, host, port, user, database, auth, timeout_ms: given_timeout_ms ?? default_timeout_ms(statement_ms), params: statement_timeout_params(statement_ms).concat(params ?? []), auth_methods: auth_methods ?? all_auth_methods })
 	}
 
 	## Connect with the settings of a connection URL, the form hosted
@@ -285,7 +261,7 @@ Client(stream, schema) :: {
 	connect_url! = |url, { connect!: dial!, random_u64!, timeout_ms, statement_timeout_ms, auth_methods }| {
 		settings = ConnectionUrl.parse(url) ? |err| InvalidConnectionUrl(err)
 		statement_ms = statement_timeout_ms ?? 0
-		connect!({ connect!: dial!, random_u64!, host: settings.host, port: settings.port, user: settings.user, database: settings.database, auth: settings.auth, params: settings.params, timeout_ms: timeout_ms ?? default_timeout_ms(statement_ms), statement_timeout_ms: statement_ms, auth_methods: auth_methods ?? all_auth_methods })
+		connect_with!({ dial!, random_u64!, host: settings.host, port: settings.port, user: settings.user, database: settings.database, auth: settings.auth, timeout_ms: timeout_ms ?? default_timeout_ms(statement_ms), params: statement_timeout_params(statement_ms).concat(settings.params), auth_methods: auth_methods ?? all_auth_methods })
 	}
 
 	## A stream from a platform whose reads and writes take no timeout, given
@@ -481,8 +457,7 @@ Client(stream, schema) :: {
 		Params : params
 		Row : row
 		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
-		fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| PgDecodeErr("a field of the row type is a record, which a result row cannot fill")
-		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, Sql.unverified(sql), named)?
+		result = run_checked!(client, Sql.text(sql), Sql.params(sql), Sql.fields(sql), Sql.unverified(sql), named)?
 		decode_rows(result, Row.parser_for(RowFormat.Text))
 	}
 
@@ -883,6 +858,41 @@ read_message! = |client| {
 			Err(err) => Err(PgProtoErr(err))
 		}
 	}
+}
+
+## [Client.connect!] once the optional settings have their defaults, and
+## `params` includes the statement timeout.
+##
+## This is its own function so that a default of each optional setting
+## costs one call. The compiler gives every `??` on an optional field its
+## own copy of the code that follows, so with the body below in
+## `connect!` its four optional fields made 16 copies of it, a third of
+## the machine code of an app that only connects.
+connect_with! : { dial! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms : U64, params : List((Str, Str)), auth_methods : List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, others))
+connect_with! = |{ dial!, random_u64!: random!, host, port, user, database, auth, timeout_ms, params, auth_methods }| {
+	# The startup message is a list of C strings, so a NUL byte in any of
+	# them would end it early and turn the rest into settings of its own.
+	for (name, _) in params {
+		if !is_session_setting(name) {
+			return Err(ParamNotAllowed(name))
+		}
+	}
+	check_no_nul(user, "user")?
+	check_no_nul(database, "database")?
+	for (name, value) in params {
+		check_no_nul(name, "a parameter name")?
+		check_no_nul(value, "parameter ${name}")?
+	}
+	match auth {
+		Password(password) => check_no_nul(password, "password")?
+		NoAuth => {}
+	}
+	stream =
+		match dial!(host, port, timeout_ms) {
+			Ok(s) => Ok(s)
+			Err(err) => Err(PgConnectErr(TcpConnectErr(err)))
+		}?
+	do_startup!(stream, { user, database, auth, timeout_ms, params, auth_methods, random_u64!: random! })
 }
 
 ## The startup conversation: send the startup message, answer an auth
