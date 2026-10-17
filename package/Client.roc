@@ -438,9 +438,13 @@ Client(stream, schema) :: {
 	##   type that does not fit its field.
 	## - `PgDecodeErr(message)` and `MissingRequiredField(name)`: a value
 	##   could not be decoded into its field.
+	## - `DuplicateColumn(name)`: the result has more than one column named
+	##   after a field, so the field could take either. The build refuses
+	##   such a query when it can see the columns, so this comes from a `*` it
+	##   could not expand, such as one under `NoSchema`.
 	## - `ParamsNotARecord` and `NestedParam(name)`: the parameters are not a
 	##   flat record.
-	TypedErr(read, write, others) : Client.CommandErr(read, write, [ParamsNotARecord, NestedParam(Str), PgTypeMismatch({ column : Str, type : Str, field : Str }), PgDecodeErr(Str), MissingRequiredField(Str), ..others])
+	TypedErr(read, write, others) : Client.CommandErr(read, write, [ParamsNotARecord, NestedParam(Str), PgTypeMismatch({ column : Str, type : Str, field : Str }), PgDecodeErr(Str), MissingRequiredField(Str), DuplicateColumn(Str), ..others])
 
 	## [Client.TypedErr] plus `EmptyResult` and `MultipleRows(n)`.
 	TypedOneErr(read, write, others) : Client.TypedErr(read, write, [EmptyResult, MultipleRows(U64), ..others])
@@ -1009,6 +1013,7 @@ run_checked! = |client, text, names, fields, named| {
 	ordered = ParamFormat.bind(names, named)
 	# `text` was checked when the app was built, by `Sql.from_quote`.
 	{ result, columns } = run_statement!(client, Statement.new_unchecked(text).bind(ordered))?
+	duplicate_field(columns.map(|c| c.name), fields)?
 	for column in columns {
 		match fields.find_first(|f| f.name == column.name) {
 			Ok(field) =>
@@ -1021,6 +1026,17 @@ run_checked! = |client, text, names, fields, named| {
 	}
 	Ok(result)
 }
+
+## A field that more than one column of the result is named after.
+duplicate_field : List(Str), List(RowFormat.Field) -> Try({}, [DuplicateColumn(Str), ..others])
+duplicate_field = |names, fields|
+	match fields.find_first(|f| names.count_if(|name| name == f.name) > 1) {
+		Ok(field) => Err(DuplicateColumn(field.name))
+		Err(_) => Ok({})
+	}
+
+expect duplicate_field(["id", "name", "id"], [{ name: "name", kind: "Str", nullable: Bool.False }]) == Ok({})
+expect duplicate_field(["id", "name", "id"], [{ name: "id", kind: "I32", nullable: Bool.False }]) == Err(DuplicateColumn("id"))
 
 decode_rows : PgResult.PgResult, (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)) -> Try(List(row), [PgDecodeErr(Str), MissingRequiredField(Str), ..others])
 decode_rows = |result, parse| {

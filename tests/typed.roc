@@ -28,6 +28,10 @@ schema_sql =
 	\\    tags text[] NOT NULL,
 	\\    score numeric NOT NULL
 	\\);
+	\\
+	\\CREATE TABLE public.typed_badges (
+	\\    person_id integer NOT NULL
+	\\);
 
 catalog : Catalog
 catalog = Catalog.from_schema(schema_sql)
@@ -57,6 +61,10 @@ main! = |args| {
 	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host, port, user, database, auth: NoAuth, timeout_ms: 5000 })?
 	_ = client.execute_unchecked!("drop table if exists typed_people", [])?
 	_ = client.execute_unchecked!("create table typed_people (id integer not null, name text not null, email text, age integer, tags text[] not null, score numeric not null)", [])?
+	# The schema above lacks `name`, as when the database got a column
+	# before the app was rebuilt.
+	_ = client.execute_unchecked!("drop table if exists typed_badges", [])?
+	_ = client.execute_unchecked!("create table typed_badges (person_id integer not null, name text not null)", [])?
 
 	test_insert_and_select!(client)?
 	test_one_and_optional!(client)?
@@ -157,6 +165,17 @@ test_runtime_checks! = |db| {
 		"NULL in a field that does not take it",
 		match null_age {
 			Err(PgDecodeErr(_)) => Bool.True
+			_ => Bool.False
+		},
+	)?
+	# The build sees one `name`, the server returns the badge's too.
+	_ = db.execute_unchecked!("insert into typed_badges values (2, 'pioneer')", [])?
+	badges : Try(List({ person_id : I32, name : Str }), _)
+	badges = db.query!("select b.*, p.name from typed_badges b join typed_people p on p.id = b.person_id", {})
+	check(
+		"two columns named after one field",
+		match badges {
+			Err(DuplicateColumn("name")) => Bool.True
 			_ => Bool.False
 		},
 	)?
