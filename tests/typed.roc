@@ -168,6 +168,11 @@ test_runtime_checks! = |db| {
 			_ => Bool.False
 		},
 	)?
+	# numeric division gives 20 places here, a Dec keeps 18.
+	third : List({ x : Dec })
+	third = db.query!("select 1::numeric / 3 as x", {})?
+	check("a numeric with more places than a Dec", third == [{ x: 0.333333333333333333 }])?
+
 	# The build sees one `name`, the server returns the badge's too.
 	_ = db.execute_unchecked!("insert into typed_badges values (2, 'pioneer')", [])?
 	badges : Try(List({ person_id : I32, name : Str }), _)

@@ -203,7 +203,7 @@ RowFormat := [Text, Nulls, Kinds].{
 	parse_i64 = |format, state| number(format, state, "I64", "an I64", I64.from_str, 0)
 
 	parse_dec : RowFormat, RowFormat.State -> Try({ value : Dec, rest : RowFormat.State }, [PgDecodeErr(Str)])
-	parse_dec = |format, state| number(format, state, "Dec", "a Dec", Dec.from_str, 0)
+	parse_dec = |format, state| number(format, state, "Dec", "a Dec", PgResult.dec_from_text, 0)
 
 	parse_f32 : RowFormat, RowFormat.State -> Try({ value : F32, rest : RowFormat.State }, [PgDecodeErr(Str)])
 	parse_f32 = |format, state| number(format, state, "F32", "an F32", F32.from_str, 0)

@@ -130,7 +130,7 @@ PgResult :: {
 		f64 = |row, name| F64.from_str(Row.str(row, name)?).map_err(|_| InvalidNumStr(name))
 
 		dec : Row, Str -> Try(Dec, [FieldNotFound(Str), UnexpectedNull(Str), BadUtf8(Str), InvalidNumStr(Str)])
-		dec = |row, name| Dec.from_str(Row.str(row, name)?).map_err(|_| InvalidNumStr(name))
+		dec = |row, name| dec_text(Row.str(row, name)?).map_err(|_| InvalidNumStr(name))
 
 		u8_nullable : Row, Str -> Try([Null, Present(U8)], [FieldNotFound(Str), BadUtf8(Str), InvalidNumStr(Str)])
 		u8_nullable = |row, name|
@@ -206,7 +206,7 @@ PgResult :: {
 		dec_nullable = |row, name|
 			match Row.str_nullable(row, name)? {
 				Null => Ok(Null)
-				Present(text) => Dec.from_str(text).map_ok(|v| Present(v)).map_err(|_| InvalidNumStr(name))
+				Present(text) => dec_text(text).map_ok(|v| Present(v)).map_err(|_| InvalidNumStr(name))
 			}
 
 		## The column value as a bool (postgres text format), or `Null`.
@@ -278,6 +278,13 @@ PgResult :: {
 	## `{a,"b c",NULL}`.
 	array_elements : Str -> Try(List([Null, Present(Str)]), [InvalidArray])
 	array_elements = |text| parse_array(text)
+
+	## A `numeric` value in Postgres text form as a [Dec]. Digits past the
+	## 18th after the point are rounded off, half away from zero, as
+	## `round(x, 18)` would. Fails on `NaN`, the infinities and a value too
+	## large for a Dec.
+	dec_from_text : Str -> Try(Dec, [InvalidNumStr])
+	dec_from_text = |text| dec_text(text)
 
 	## How many rows the command returned.
 	len : PgResult -> U64
@@ -493,3 +500,77 @@ expect rows_affected_of("MERGE 1") == 1
 expect rows_affected_of("CREATE TABLE") == 0
 expect rows_affected_of("COMMIT") == 0
 expect rows_affected_of("") == 0
+
+## [PgResult.dec_from_text]. Postgres writes a numeric as an optional `-`,
+## digits and an optional fraction, never with an exponent.
+dec_text : Str -> Try(Dec, [InvalidNumStr])
+dec_text = |text| {
+	negative = text.starts_with("-")
+	unsigned = if negative text.drop_prefix("-") else text
+	{ before, after } = unsigned.split_first(".") ?? { before: unsigned, after: "" }
+	int_digits = digits(before)?
+	frac_digits = digits(after)?
+	if int_digits.is_empty() and frac_digits.is_empty() {
+		return Err(InvalidNumStr)
+	}
+	(whole, frac) =
+		if frac_digits.len() > 18 and (frac_digits.get(18) ?? 0) >= 5 {
+			round_up(int_digits, frac_digits.take_first(18))
+		} else {
+			(int_digits, frac_digits.take_first(18))
+		}
+	value = Dec.from_dec_digits((whole, frac)) ? |_| InvalidNumStr
+	Ok(if negative -value else value)
+}
+
+## The decimal digits of `text`, each 0 to 9. Fails on anything else.
+digits : Str -> Try(List(U8), [InvalidNumStr])
+digits = |text| {
+	var $out = []
+	for byte in text.to_utf8() {
+		if byte < '0' or byte > '9' {
+			return Err(InvalidNumStr)
+		}
+		$out = $out.append(byte - '0')
+	}
+	Ok($out)
+}
+
+## One more in the last fraction digit, carried as far left as it goes.
+round_up : List(U8), List(U8) -> (List(U8), List(U8))
+round_up = |whole, frac| {
+	all = whole.concat(frac)
+	var $out = []
+	var $carry = Bool.True
+	var $i = all.len()
+	while $i > 0 {
+		$i = $i - 1
+		digit = all.get($i) ?? 0
+		if $carry and digit == 9 {
+			$out = $out.prepend(0)
+		} else if $carry {
+			$out = $out.prepend(digit + 1)
+			$carry = Bool.False
+		} else {
+			$out = $out.prepend(digit)
+		}
+	}
+	carried = if $carry $out.prepend(1) else $out
+	split = carried.len() - frac.len()
+	(carried.take_first(split), carried.drop_first(split))
+}
+
+expect dec_text("12.5") == Ok(12.5)
+expect dec_text("-0.25") == Ok(-0.25)
+expect dec_text("7") == Ok(7)
+expect dec_text(".5") == Ok(0.5)
+expect dec_text("0.1234567890123456789") == Ok(0.123456789012345679)
+expect dec_text("0.1234567890123456784") == Ok(0.123456789012345678)
+expect dec_text("-0.0000000000000000005") == Ok(-0.000000000000000001)
+expect dec_text("9.9999999999999999999") == Ok(10)
+expect dec_text("1.000000000000000000000000000000") == Ok(1)
+expect dec_text("NaN") == Err(InvalidNumStr)
+expect dec_text("Infinity") == Err(InvalidNumStr)
+expect dec_text("-") == Err(InvalidNumStr)
+expect dec_text("1e5") == Err(InvalidNumStr)
+expect dec_text("99999999999999999999999999999") == Err(InvalidNumStr)
