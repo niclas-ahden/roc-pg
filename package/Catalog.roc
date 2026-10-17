@@ -84,6 +84,21 @@ Catalog :: { dump : Dump }.{
 	functions : Catalog -> List(Catalog.Function)
 	functions = |catalog| catalog.dump.functions()
 
+	## The columns of each table the dump creates, for
+	## [Client.verify_schema!] to compare with the database's. A view's
+	## columns come from its query, so views are left out. `type` is as
+	## the analysis spells it: a domain's base type, unless the domain
+	## bounds its integers.
+	expected_columns : Catalog -> List({ schema : Str, table : Str, columns : List({ name : Str, type : Str, not_null : Bool }) })
+	expected_columns = |catalog|
+		catalog.dump.tables().keep_oks(
+			|t|
+				match t.columns {
+					Known(columns) => Ok({ schema: t.schema, table: t.name, columns: columns.map(|c| { name: c.name, type: c.type, not_null: c.not_null }) })
+					_ => Err(NotATable)
+				},
+		)
+
 	## Everything a checked query's string literal is checked for (see
 	## [Sql]): the SQL against this catalog, the placeholders against the
 	## fields of the parameter record, and the result columns against the

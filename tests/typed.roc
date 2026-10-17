@@ -176,6 +176,16 @@ test_runtime_checks! = |db| {
 	reds = db.query!("select red from typed_pixels", {})?
 	check("a bounded domain into a narrower field", reds == [{ red: 200 }])?
 
+	# The dump above lacks the badge's name, as a dump older than the
+	# database would.
+	check(
+		"a database that differs from the dump",
+		match db.verify_schema!() {
+			Err(SchemaDiffers(differences)) => differences == ["column `public.typed_badges.name` is in the database but not in the dump"]
+			_ => Bool.False
+		},
+	)?
+
 	# numeric division gives 20 places here, a Dec keeps 18.
 	third : List({ x : Dec })
 	third = db.query!("select 1::numeric / 3 as x", {})?

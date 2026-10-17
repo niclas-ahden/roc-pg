@@ -660,6 +660,44 @@ Client(stream, schema) :: {
 		}
 	}
 
+	## Compare the database with the schema the app's queries were checked
+	## against, the dump that [Catalog.from_schema] read when the app was
+	## built. Fails with `SchemaDiffers(differences)`, one line for each, when
+	## a table of the dump is missing, a column is missing or added, a
+	## column's type differs, or a column the dump says is `NOT NULL` can be
+	## NULL in the database or the other way around. Call it once after
+	## connecting, so that a database that moved on from the dump stops the
+	## app at startup instead of failing a query later.
+	##
+	## ```
+	## db.verify_schema!()?
+	## ```
+	##
+	## Views are not compared, as their columns come from their queries.
+	verify_schema! : Client(_, schema) => Try({}, Client.CommandErr(_, _, [SchemaDiffers(List(Str)), ..others]))
+		where [
+			schema.catalog : {} -> catalog,
+			catalog.expected_columns : catalog -> List({ schema : Str, table : Str, columns : List({ name : Str, type : Str, not_null : Bool }) }),
+		]
+	verify_schema! = |client| {
+		Schema : schema
+		expected = Schema.catalog({}).expected_columns()
+		# The reply of a query of the server's own catalogs always decodes.
+		unread = |_| PgProtoErr(UnexpectedMsg("a reply to the schema query that does not decode"))
+		live = client.query_unchecked!(
+			live_columns_sql,
+			[],
+			|row| {
+				text = |name| row.str(name).map_err(unread)
+				Ok({ schema: text("schema")?, table: text("table")?, name: text("name")?, type: text("type")?, base: text("base")?, not_null: row.bool("not_null").map_err(unread)? })
+			},
+		)?
+		match schema_differences(expected, live) {
+			[] => Ok({})
+			differences => Err(SchemaDiffers(differences))
+		}
+	}
+
 	## Render a server error (the payload of `PgErr`) as a readable string.
 	error_to_str : Client.ServerError -> Str
 	error_to_str = |err| {
@@ -1355,3 +1393,66 @@ expect password_for(with_methods([Scram, Cleartext]), Md5, "md5") == Err(AuthMet
 expect password_for(with_methods([Scram]), Cleartext, "password") == Err(AuthMethodNotAllowed("password"))
 expect password_for(with_methods([Md5]), Md5, "md5") == Ok("secret")
 expect password_for({ auth_methods: all_auth_methods, auth: NoAuth }, Md5, "md5") == Err(PasswordRequired)
+
+## The columns of the database's tables, outside the system schemas. `type`
+## is the column's type as `format_type` spells it, without a schema, and
+## `base` a domain's base type. A column of a `NOT NULL` domain counts as
+## `NOT NULL`, as the dump's reading has it.
+live_columns_sql : Str
+live_columns_sql =
+	\\select n.nspname as schema, c.relname as table, a.attname as name,
+	\\    regexp_replace(format_type(a.atttypid, null), '^[^".]+[.]', '') as type,
+	\\    regexp_replace(format_type(case when t.typtype = 'd' then t.typbasetype else a.atttypid end, null), '^[^".]+[.]', '') as base,
+	\\    a.attnotnull or (t.typtype = 'd' and t.typnotnull) as not_null
+	\\from pg_attribute a
+	\\join pg_class c on c.oid = a.attrelid
+	\\join pg_namespace n on n.oid = c.relnamespace
+	\\join pg_type t on t.oid = a.atttypid
+	\\where a.attnum > 0 and not a.attisdropped and c.relkind in ('r', 'p', 'f')
+	\\    and n.nspname not in ('pg_catalog', 'information_schema') and n.nspname not like 'pg_toast%'
+	\\order by n.nspname, c.relname, a.attnum
+
+## How the database differs from the dump, one line for each difference.
+schema_differences : List({ schema : Str, table : Str, columns : List({ name : Str, type : Str, not_null : Bool }) }), List({ schema : Str, table : Str, name : Str, type : Str, base : Str, not_null : Bool }) -> List(Str)
+schema_differences = |expected, live|
+	expected.fold(
+		[],
+		|acc, table| {
+			named = "${table.schema}.${table.table}"
+			columns = live.keep_if(|c| c.schema == table.schema and c.table == table.table)
+			if columns.is_empty() {
+				acc.append("table `${named}` is in the dump but not in the database")
+			} else {
+				missing = table.columns.keep_if(|e| !columns.any(|c| c.name == e.name)).map(|e| "column `${named}.${e.name}` is in the dump but not in the database")
+				added = columns.keep_if(|c| !table.columns.any(|e| e.name == c.name)).map(|c| "column `${named}.${c.name}` is in the database but not in the dump")
+				changed = table.columns.fold(
+					[],
+					|found, e|
+						match columns.find_first(|c| c.name == e.name) {
+							Ok(c) if e.type != c.type and e.type != c.base => found.append("column `${named}.${e.name}` is `${e.type}` in the dump but `${c.type}` in the database")
+							Ok(c) if e.not_null and !c.not_null => found.append("column `${named}.${e.name}` is NOT NULL in the dump but can be NULL in the database")
+							Ok(c) if !e.not_null and c.not_null => found.append("column `${named}.${e.name}` can be NULL in the dump but is NOT NULL in the database")
+							_ => found
+						},
+				)
+				acc.concat(missing).concat(added).concat(changed)
+			}
+		},
+	)
+
+expect {
+	expected = [{ schema: "public", table: "people", columns: [{ name: "id", type: "integer", not_null: Bool.True }, { name: "name", type: "text", not_null: Bool.True }, { name: "age", type: "u8", not_null: Bool.False }] }, { schema: "public", table: "gone", columns: [] }]
+	live = [
+		{ schema: "public", table: "people", name: "id", type: "bigint", base: "bigint", not_null: Bool.True },
+		{ schema: "public", table: "people", name: "name", type: "text", base: "text", not_null: Bool.False },
+		{ schema: "public", table: "people", name: "age", type: "u8", base: "smallint", not_null: Bool.False },
+		{ schema: "public", table: "people", name: "email", type: "text", base: "text", not_null: Bool.False },
+	]
+	schema_differences(expected, live)
+	== [
+		"column `public.people.email` is in the database but not in the dump",
+		"column `public.people.id` is `integer` in the dump but `bigint` in the database",
+		"column `public.people.name` is NOT NULL in the dump but can be NULL in the database",
+		"table `public.gone` is in the dump but not in the database",
+	]
+}
