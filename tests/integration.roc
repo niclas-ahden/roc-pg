@@ -58,6 +58,7 @@ main! = |args| {
 	test_nested_transactions!(client)?
 	test_nested_transactions_quiet!(client)?
 	test_execute_counts!(client)?
+	test_pipeline!(client)?
 	test_batch_execute!(client)?
 	test_query_one!(client)?
 	test_query_optional!(client)?
@@ -442,6 +443,72 @@ test_execute_counts! = |client| {
 	check("PgResult.rows_affected", PgResult.rows_affected(result) == 2)?
 	_ = client.execute_unchecked!("drop table counted", [])?
 	Stdout.line!("ok: execute counts")
+}
+
+## The names in `piped`, in the order of their ids.
+piped_names! = |client|
+	client.query_unchecked!("select name from piped order by id", [], |row| row.str("name"))
+
+## Statements sent together and answered in one round trip: each one's row
+## count in order, every write or none, and a usable connection after a
+## failure.
+test_pipeline! = |client| {
+	_ = client.execute_unchecked!("create temp table piped (id int primary key, name text not null)", [])?
+	add = |id, name| { sql: "insert into piped (id, name) values ($1, $2)", params: [Param.i32(id), Param.str(name)] }
+
+	nothing = client.pipeline_unchecked!([])?
+	check("an empty pipeline", nothing == [])?
+
+	counts = client.pipeline_unchecked!([
+		add(1, "Hedy"),
+		add(2, "Lise"),
+		{ sql: "update piped set name = name || '!' where id >= $1", params: [Param.i32(1)] },
+		{ sql: "select name from piped", params: [] },
+		{ sql: "delete from piped where id = $1", params: [Param.i32(2)] },
+	])?
+	check("each statement's row count, in order", counts == [1, 1, 2, 2, 1])?
+	check("the pipeline's writes landed", piped_names!(client)? == ["Hedy!"])?
+
+	# The third insert repeats id 3. The server skips the fourth, and
+	# outside a transaction the pipeline is one transaction of its own, so
+	# the first two are rolled back.
+	failing = [add(3, "Emmy"), add(4, "Rosalind"), add(3, "Chien-Shiung"), add(5, "Dorothy")]
+	check(
+		"a failing statement fails the pipeline with its place and error",
+		match client.pipeline_unchecked!(failing) {
+			Err(PgPipelineErr({ index: 2, error: { code: "23505", .. } })) => Bool.True
+			_ => Bool.False
+		},
+	)?
+	check("a failed pipeline outside a transaction stores nothing", piped_names!(client)? == ["Hedy!"])?
+
+	in_transaction = client.transaction!(
+		|tx| {
+			_ = tx.execute_unchecked!("update piped set name = $1 where id = $2", [Param.str("Hedy Lamarr"), Param.i32(1)])?
+			tx.pipeline_unchecked!(failing)
+		},
+	)
+	check(
+		"a failing pipeline fails its transaction",
+		match in_transaction {
+			Err(PgPipelineErr({ index: 2, error: { code: "23505", .. } })) => Bool.True
+			_ => Bool.False
+		},
+	)?
+	check("and the transaction is rolled back", piped_names!(client)? == ["Hedy!"])?
+
+	# A thousand statements in one round trip.
+	many = List.repeat("Noether", 1000).map_with_index(|name, i| { sql: "insert into piped (id, name) values ($1, $2)", params: [Param.u64(100 + i), Param.str(name)] })
+	many_counts = client.pipeline_unchecked!(many)?
+	check("a thousand statements, a count each", many_counts == List.repeat(1, 1000))?
+	stored_many = client.query_one_unchecked!("select count(*)::int as n from piped where id >= 100", [], |row| row.i32("n"))?
+	check("a thousand rows stored", stored_many == 1000)?
+	_ = client.execute_unchecked!("delete from piped where id >= 100", [])?
+
+	_ = client.transaction!(|tx| tx.pipeline_unchecked!([add(6, "Ada Yonath")]))?
+	check("a pipeline in a transaction lands with its commit", piped_names!(client)? == ["Hedy!", "Ada Yonath"])?
+	_ = client.execute_unchecked!("drop table piped", [])?
+	Stdout.line!("ok: pipeline")
 }
 
 ## Several statements in one simple query. The server splits them, so a `;`
