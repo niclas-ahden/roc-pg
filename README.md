@@ -6,8 +6,8 @@ A PostgreSQL client for Roc that checks every SQL query when the app compiles. W
 
 ```roc
 app [main!] {
-	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
-	pg: "https://github.com/niclas-ahden/roc-pg/releases/download/0.4.0/CbveR51siNCGVdf1AGUc9LJvRZ29biS7nDWJYibSFS76.tar.zst",
+    pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
+    pg: "https://github.com/niclas-ahden/roc-pg/releases/download/0.4.0/CbveR51siNCGVdf1AGUc9LJvRZ29biS7nDWJYibSFS76.tar.zst",
 }
 
 import pf.Stdout
@@ -21,23 +21,23 @@ catalog : Catalog
 catalog = Catalog.from_schema(schema_sql)
 
 Schema := [].{
-	catalog : {} -> Catalog
-	catalog = |{}| catalog
+    catalog : {} -> Catalog
+    catalog = |{}| catalog
 }
 
 main! = |_| {
-	db : Client.Client(Tcp.Stream, Schema)
-	db = Client.connect_url!("some-database-url", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
+    db : Client.Client(Tcp.Stream, Schema)
+    db = Client.connect_url!("some-database-url", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
 
-	planets = db.query!("SELECT id, name FROM planets WHERE gravity = $gravity", { gravity: 9.80665 })?
+    planets = db.query!("SELECT id, name FROM planets WHERE gravity = $gravity", { gravity: 9.80665 })?
 
-	for planet in planets {
-		Stdout.line!("${planet.name} (#${I32.to_str(planet.id)})")?
-	}
+    for planet in planets {
+        Stdout.line!("${planet.name} (ID ${I32.to_str(planet.id)})")?
+    }
 
-	db.close!()
+    db.close!()
 
-	Ok({})
+    Ok({})
 }
 ```
 Isn't that sweet? Real SQL, but with named arguments (who doesn't want that?), and high type safety without ceremony.
@@ -53,6 +53,8 @@ You dump your database schema to a file, like `schema.sql`, and import that in y
 Since this is "just" parsing strings, `roc-pg` can give fast and correct feedback without ever having to connect to your database.
 
 ## How does it compare to X?
+
+There are many great Postgres clients and these are some similar ones:
 
 - Similar to [`sqlx`](https://github.com/transact-rs/sqlx), but it doesn't connect to your database to check queries. It just parses your files on disk.
 - Similar to [`sqlc`](https://github.com/sqlc-dev/sqlc), but it doesn't generate code. You just run your queries and use the records you get back.
@@ -147,6 +149,38 @@ Use `Dec` for most decimal numbers. It is fast and holds 18 digits after the poi
 
 Use `Numeric` only when you need the extra precision, or a number too large for a `Dec`. It is exact and of any size, keeps its scale like Postgres does (`1.50` stays `1.50`), and adds, subtracts, multiplies and divides as Postgres does. Division gives the same digits as Postgres's `/`, so `1 / 3` is `0.33333333333333333333`. It is slower than a `Dec`.
 
+## Arrays and enums
+
+A `List` in the parameter record is sent as a Postgres array. Use it with `= any(...)` to match a column against every element of the list:
+
+```roc
+ids : List(I32)
+ids = [1, 5, 8]
+
+users = db.query!("SELECT id, name FROM users WHERE id = any($ids)", { ids, })?
+```
+
+The build checks that the elements fit the column. A number literal on its own is a `Dec` in Roc, which is why `ids` has a type above. Without it the build says that `id` is `integer`, so `$ids` must be a list of it, but it is `List(Dec)`.
+
+Arrays work in the other direction too. A `text[]` column goes into a `List(Str)` field, and a `List` parameter fills an array column, as in `UPDATE users SET tags = $tags`.
+
+An enum label is a `Str`, as a parameter and as a field. With this schema:
+
+```sql
+CREATE TYPE public.role AS ENUM ('admin', 'editor', 'viewer');
+CREATE TABLE public.users (id integer NOT NULL, name text NOT NULL, role public.role NOT NULL);
+```
+
+you write:
+
+```roc
+editors = db.query!("SELECT name, role FROM users WHERE role = any($roles)", { roles: ["admin", "editor"] })?
+
+_ = db.execute!("UPDATE users SET role = $role WHERE id = $id", { role: "viewer", id: user_id })?
+```
+
+and `editors` is a `List({ name : Str, role : Str })`. The build doesn't check the labels themselves. A label the enum doesn't have, such as `"admn"`, fails when the query runs, with a `PgErr` from the server.
+
 ## Schemas and the search path
 
 A table or function named without a schema is looked up the way the server does it: in `pg_catalog`, then in each schema of the search path in order. The search path is `["public"]` unless you set it, and it must be the same as the one the server uses for the app's connections:
@@ -166,6 +200,92 @@ db.verify_schema!()?
 When the build could not see a row field's column type, the query checks that column's type against the server's result description each time it runs. That check runs after the statement did, so an `UPDATE ... RETURNING` has changed rows by the time it fails.
 
 A checked query whose result has two columns named after one field fails with `DuplicateColumn`, as either could fill it. An unchecked row reads the first such column, as libpq does.
+
+## Queries built at runtime
+
+`query!` and the other checked functions take the SQL as a string literal, since the build reads it. For SQL that the app puts together while it runs there are unchecked versions: `query_unchecked!`, `query_one_unchecked!`, `query_optional_unchecked!`, `execute_unchecked!`, `pipeline_unchecked!` and `batch_execute_unchecked!`. They take positional placeholders (`$1`, `$2`, ...), a list of `Param`s, and a function that decodes each row by column name:
+
+```roc
+import pg.Param
+
+ids = db.query_unchecked!(
+	"SELECT id FROM users WHERE role = any($1)",
+	[Param.list(roles.map(Param.str))],
+	|row| row.i32("id"),
+)?
+```
+
+Nothing about them is checked before they run. `Param.str`, `Param.i32`, `Param.bool`, `Param.null` and friends make the parameters, and `Param.list` makes an array of them. A row has accessors such as `row.str("name")`, `row.i64("id")`, `row.str_list("tags")` and `row.list("ids", decode_elem)`.
+
+## Connecting
+
+`Client.connect!` takes the connection settings as fields, and `Client.connect_url!` takes them as a URL (see the example at the top). Both also take two functions from the platform: `connect!`, which opens a TCP stream, and `random_u64!`, which a SCRAM login needs.
+
+### Platforms
+
+- [roc-lang/basic-cli](https://github.com/roc-lang/basic-cli): pass `Tcp.connect!` and `Random.seed_u64!`. Any platform whose TCP streams have `write!` and `read_exactly!` methods that take a timeout in milliseconds works the same way.
+- [roc-lang/basic-webserver](https://github.com/roc-lang/basic-webserver): its streams take no timeout (the platform gives each operation a fixed 30 seconds), so wrap its dial, `connect!: Client.fixed_timeout(Tcp.connect!)`. It has no random numbers, so pass `random_u64!: || Err(NoRandom)`. That rules out SCRAM logins there, so log in another way, such as trust or md5. The client is then a `Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)`.
+
+### Authentication
+
+`auth` is `NoAuth` or `Password(str)`. The server decides how it checks a password, and the client answers each of PostgreSQL's three password methods: SCRAM-SHA-256 (PostgreSQL 10 or later, with [roc-scram](https://github.com/niclas-ahden/roc-scram)), md5 (with [roc-md5](https://github.com/niclas-ahden/roc-md5)) and cleartext. The optional `auth_methods` lists the logins the client agrees to, named as in pg_hba.conf:
+
+- `Scram`: SCRAM-SHA-256.
+- `Md5`: an md5 hash of the password.
+- `Cleartext`: the password itself (pg_hba's `password`).
+- `Trust`: no login at all, the server lets the client in unasked.
+
+A login the server asks for that is not listed fails with `AuthMethodNotAllowed(method)`. By default all four are allowed. An app that knows how its server logs in says so, like `auth_methods: [Md5]`.
+
+### Connection URLs
+
+`Client.connect_url!(url, { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })` connects with a URL like `postgresql://user:password@localhost:6432/app`, and `ConnectionUrl.parse(url)` gives its settings.
+
+The syntax is parsed by [roc-database-url](https://github.com/niclas-ahden/roc-database-url). The meaning follows [libpq](https://www.postgresql.org/docs/current/libpq.html): the port defaults to 5432 and the database to the user's name, and `application_name` and the `-c name=value` settings of `options` become session parameters. The connection is plaintext for now (see [TLS](#tls)), which `sslmode` `disable`, `allow` and `prefer` (the default) settle for. `require`, `verify-ca` and `verify-full` demand TLS and are refused with `UnsupportedSslMode(mode)`, and any other option with `UnsupportedOption(name)`, so nothing a URL asks for is silently ignored.
+
+## Timeouts
+
+We've got two and they're both optional in `Client.connect!` and `Client.connect_url!`:
+
+- `statement_timeout_ms`: how long a statement may run before the server cancels it (`PgErr`, SQLSTATE `57014`). The connection stays usable. Off by default, as in Postgres. It is sent as a startup parameter, so it is the session's default, and one transaction can lift it with `set local statement_timeout = 0`. Behind [PgBouncer](https://www.pgbouncer.org) set it on the role instead, see [Web servers](#web-servers).
+- `timeout_ms`: how long the dial and one read or write may wait, the backstop for a server or network that stops answering. The server sends nothing while a statement runs, so it must outlast the longest one. By default 5 seconds more than `statement_timeout_ms`, or 60 seconds without one. Through `Client.fixed_timeout` the platform's own timeout applies instead.
+
+## TLS
+
+`roc-pg` connects in plaintext for now, because neither [roc-lang/basic-cli](https://github.com/roc-lang/basic-cli) nor [roc-lang/basic-webserver](https://github.com/roc-lang/basic-webserver) offers TLS on its TCP streams yet. Postgres starts TLS on an open connection, after a short plaintext exchange, so the platform needs a way to upgrade a TCP stream to TLS. `roc-pg` can easily support TLS once platform support rolls out.
+
+Until then a server that demands TLS refuses the connection, and a password travels in the clear. That is fine for a server on the same machine or on a private network. To reach a database elsewhere, you can connect to a TLS proxy on your own machine instead, such as a [PgBouncer](https://www.pgbouncer.org) with `server_tls_sslmode` set.
+
+## Web servers
+
+A `Client` is one connection, and a connection carries one conversation at a time. The handlers of a web server run at the same time, so never keep a client where they all reach it, such as a web server's context. Their messages would interleave, and each could read the other's reply, or land in the other's transaction. The package has no connection pool, so the simplest safe setup keeps the connection settings in the context and connects in each request:
+
+```roc
+Context : { host : Str, port : U16, user : Str, database : Str }
+
+Db : Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)
+
+with_db! = |{ host, port, user, database }, body!| {
+	db : Db
+	db = Client.connect!({ connect!: Client.fixed_timeout(Tcp.connect!), random_u64!: || Err(NoRandom), host, port, user, database, auth: NoAuth })?
+	result = body!(db)
+	db.close!()
+	result
+}
+
+respond! = |request, context| {
+	user = with_db!(context, |db| db.query_one!("SELECT name FROM users WHERE id = $id", { id, }))?
+	...
+}
+```
+
+For a busy web server you may want a [PgBouncer](https://www.pgbouncer.org) on the same machine. It keeps the connections to the database open, which makes connecting in each request cheap, and it lets you securely connect to a database elsewhere (see [TLS](#tls)). [examples/webserver.roc](examples/webserver.roc) is a runnable version.
+
+If you use [PgBouncer](https://www.pgbouncer.org) in transaction mode:
+
+- [PgBouncer](https://www.pgbouncer.org) refuses startup parameters it does not know, so set `statement_timeout` on the role (`alter role my_app set statement_timeout = '30s'`) rather than with `statement_timeout_ms`, and leave settings other than `application_name` out of `params`.
+- Named prepared statements (`prepare_unchecked!`) need [PgBouncer](https://www.pgbouncer.org) 1.21 or later with `max_prepared_statements` set. `query!`, `execute!` and the rest use unnamed statements and need nothing.
+- Session state (`set`, session advisory locks, temp tables) does not last from one transaction to the next. Use `set local` inside a transaction.
 
 ## Getting started
 
@@ -191,9 +311,12 @@ roc build main.roc --output=app
 
 Start with [the minimal example](examples/minimal/main.roc) which shows how to use `roc-pg`. The other examples (`small`, and `rebellion`) are mainly for performance optimizations of the Roc compiler and `roc-pg` itself.
 
-## Not supported
+## Limitations
 
-- `LISTEN` and `NOTIFY`. A session can run them, but the client never delivers a notification. It reads past any that arrive.
+- Plaintext only, until a platform offers TLS on TCP streams (see [TLS](#tls)). A server that demands TLS refuses the connection.
+- No connection pool in the package. See [Web servers](#web-servers) for connecting in each request.
+- No `LISTEN` and `NOTIFY`. A session can run them, but the client never delivers a notification. It reads past any that arrive.
+- Notices are consumed and dropped.
 
 ## Tests
 
@@ -202,3 +325,7 @@ nix develop -c roc test package/main.roc
 ```
 
 runs the package's unit tests. `nix develop -c ./tests.roc` runs everything, including a check of every example and integration tests against a temporary Postgres, which the development shell provides.
+
+## Documentation
+
+View the full API documentation at [https://niclas-ahden.github.io/roc-pg/](https://niclas-ahden.github.io/roc-pg/).
