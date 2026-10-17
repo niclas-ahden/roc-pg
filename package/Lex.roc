@@ -371,7 +371,6 @@ string_end = |bytes, start, escapes| {
 			$i = $i + 1
 		}
 	}
-	Ok($i)
 }
 
 ## After the opening double quote: `""` is a double quote.
@@ -392,7 +391,6 @@ quoted_end = |bytes, start| {
 			$i = $i + 1
 		}
 	}
-	Ok($i)
 }
 
 ## The name inside a quoted identifier, `""` turned back into `"`.

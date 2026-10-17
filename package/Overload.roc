@@ -541,7 +541,6 @@ compare_key = |table, start, key| {
 		}
 		$i = $i + 1
 	}
-	Same
 }
 
 enums = ["access_level"]

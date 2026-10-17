@@ -10,7 +10,7 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     # The Roc compiler revision, keep the `?dir=src` at the end
-    roc-src.url = "github:roc-lang/roc/b797cda76e77b9e514c2192ca6513d0ba9a39070?dir=src";
+    roc-src.url = "github:roc-lang/roc/7d7b432ae810e4747d06e43e32b50c98e84bf80a?dir=src";
     roc-nix = {
       url = "github:niclas-ahden/roc-nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -23,20 +23,20 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # Builds Roc using `ReleaseFast`. To chase a suspected compiler fault,
-        # build a `ReleaseSafe` variant of the same revision:
-        #
-        #   roc-nix.lib.${system}.mkRoc { optimize = "ReleaseSafe"; }
-        #
-        # roc-nix's README lists the rest of the build options, patches
-        # included.
+        # Builds Roc using `ReleaseFast`. roc-nix's README lists the rest of
+        # the build options, patches included.
         roc = roc-nix.packages.${system}.roc;
+
+        # The same revision built `ReleaseSafe`, to chase a suspected
+        # compiler fault. A safe build checks the compiler's own invariants,
+        # so a fault that would be a bare SIGSEGV names itself instead.
+        rocReleaseSafe = roc-nix.lib.${system}.mkRoc { optimize = "ReleaseSafe"; };
       in
       {
         formatter = pkgs.nixpkgs-fmt;
 
         packages = {
-          inherit roc;
+          inherit roc rocReleaseSafe;
           default = roc;
         };
 

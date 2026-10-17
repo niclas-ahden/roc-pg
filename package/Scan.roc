@@ -371,7 +371,6 @@ continuation = |bytes, p| {
 			return Err(NoContinuation)
 		}
 	}
-	Err(NoContinuation)
 }
 
 ## One backslash escape of an `E'...'` string, at `p`: the bytes it adds,
@@ -746,7 +745,6 @@ comment_end = |bytes, start| {
 			$p = $p + 1
 		}
 	}
-	Ok($p)
 }
 
 ## An operator at `i`: a run of operator characters, cut where a comment

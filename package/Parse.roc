@@ -388,7 +388,6 @@ run = |source| {
 			$states = $states.append(goto)
 		}
 	}
-	Ok([])
 }
 
 ## The value a token carries into the grammar: its text for names,

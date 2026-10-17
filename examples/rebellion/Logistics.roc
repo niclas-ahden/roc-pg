@@ -1,7 +1,7 @@
 import pf.Tcp
 import pg.Client
 import Args
-import Schema exposing [Schema]
+import Schema
 
 Db : Client.Client(Tcp.Stream, Schema)
 
