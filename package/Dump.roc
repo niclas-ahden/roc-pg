@@ -862,18 +862,21 @@ expect {
 		\\CREATE FOREIGN TABLE public.remote (id integer NOT NULL) SERVER elsewhere;
 		\\CREATE TABLE public.orphan (id integer) INHERITS (public.missing);
 	catalog = Dump.parse(dump) ?? Dump.none
-	shape = |name|
-		match catalog.table(name) {
+	# WORKAROUND: `shape` takes the catalog instead of capturing it, since the
+	# dev backend frees a captured record that a closure forwards, see
+	# https://github.com/roc-lang/roc/issues/12375
+	shape = |from, name|
+		match from.table(name) {
 			Ok({ columns: Known(columns), .. }) => columns.map(|c| "${c.name} ${c.type}${if c.not_null " not null" else ""}${if c.has_default " default" else ""}")
 			_ => ["unknown"]
 		}
-	shape("base") == ["id integer not null", "at timestamp with time zone not null default", "note text default"]
-	and shape("child") == ["id integer not null", "at timestamp with time zone not null default", "note text not null default", "extra text"]
-	and shape("copy") == ["id integer not null", "at timestamp with time zone not null default", "note text", "more integer"]
-	and shape("copy_all") == ["id integer not null", "at timestamp with time zone not null default", "note text default"]
-	and shape("part_eu") == ["id integer not null", "region text not null"]
-	and shape("remote") == ["id integer not null"]
-	and shape("orphan") == ["unknown"]
+	shape(catalog, "base") == ["id integer not null", "at timestamp with time zone not null default", "note text default"]
+	and shape(catalog, "child") == ["id integer not null", "at timestamp with time zone not null default", "note text not null default", "extra text"]
+	and shape(catalog, "copy") == ["id integer not null", "at timestamp with time zone not null default", "note text", "more integer"]
+	and shape(catalog, "copy_all") == ["id integer not null", "at timestamp with time zone not null default", "note text default"]
+	and shape(catalog, "part_eu") == ["id integer not null", "region text not null"]
+	and shape(catalog, "remote") == ["id integer not null"]
+	and shape(catalog, "orphan") == ["unknown"]
 }
 
 # An aggregate of the schema.
