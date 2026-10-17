@@ -36,6 +36,13 @@ schema_sql =
 	\\
 	\\CREATE DOMAIN public.typed_u8 AS smallint CHECK (VALUE BETWEEN 0 AND 255);
 	\\CREATE TABLE public.typed_pixels (red public.typed_u8 NOT NULL);
+	\\
+	\\CREATE TYPE public.typed_role AS ENUM ('admin', 'editor', 'viewer');
+	\\CREATE TABLE public.typed_staff (
+	\\    id integer NOT NULL,
+	\\    role public.typed_role NOT NULL,
+	\\    past_roles public.typed_role[] NOT NULL
+	\\);
 
 parsed_schema = Catalog.from_schema(schema_sql)
 
@@ -69,14 +76,21 @@ main! = |args| {
 	_ = client.execute_unchecked!("drop domain if exists typed_u8", [])?
 	_ = client.execute_unchecked!("create domain typed_u8 as smallint check (value between 0 and 255)", [])?
 	_ = client.execute_unchecked!("create table typed_pixels (red typed_u8 not null)", [])?
+	_ = client.execute_unchecked!("drop table if exists typed_staff", [])?
+	_ = client.execute_unchecked!("drop type if exists typed_role", [])?
+	_ = client.execute_unchecked!("create type typed_role as enum ('admin', 'editor', 'viewer')", [])?
+	_ = client.execute_unchecked!("create table typed_staff (id integer not null, role typed_role not null, past_roles typed_role[] not null)", [])?
 
 	test_insert_and_select!(client)?
 	test_one_and_optional!(client)?
 	test_optional_filters!(client)?
+	test_arrays_and_enums!(client)?
 	test_runtime_checks!(client)?
 	test_transaction!(client)?
 
 	_ = client.execute_unchecked!("drop table typed_people", [])?
+	_ = client.execute_unchecked!("drop table typed_staff", [])?
+	_ = client.execute_unchecked!("drop type typed_role", [])?
 	client.close!()
 	Stdout.line!("all typed tests passed")?
 	Ok({})
@@ -143,6 +157,29 @@ test_one_and_optional! = |db| {
 		},
 	)?
 	Stdout.line!("ok: typed one and optional")
+}
+
+## An enum label is a `Str` and an array is a `List`, both as parameters
+## and as fields, and `= any($list)` matches any element of a list.
+test_arrays_and_enums! : Db => Try({}, _)
+test_arrays_and_enums! = |db| {
+	no_roles : List(Str)
+	no_roles = []
+	_ = db.execute!("insert into typed_staff (id, role, past_roles) values ($id, $role, $past_roles)", { id: 1.I32, role: "admin", past_roles: ["viewer", "editor"] })?
+	_ = db.execute!("insert into typed_staff (id, role, past_roles) values ($id, $role, $past_roles)", { id: 2.I32, role: "editor", past_roles: no_roles })?
+	_ = db.execute!("insert into typed_staff (id, role, past_roles) values ($id, $role, $past_roles)", { id: 3.I32, role: "viewer", past_roles: no_roles })?
+
+	staff : List({ id : I32, role : Str, past_roles : List(Str) })
+	staff = db.query!("select id, role, past_roles from typed_staff where role = any($roles) order by id", { roles: ["admin", "editor"] })?
+	check(
+		"an enum array parameter and enum fields",
+		staff == [{ id: 1, role: "admin", past_roles: ["viewer", "editor"] }, { id: 2, role: "editor", past_roles: [] }],
+	)?
+
+	by_id : List({ role : Str })
+	by_id = db.query!("select role from typed_staff where id = any($ids) order by id", { ids: [1.I32, 3.I32] })?
+	check("an integer array parameter", by_id == [{ role: "admin" }, { role: "viewer" }])?
+	Stdout.line!("ok: typed arrays and enums")
 }
 
 ## What only running the query tells: what the server says about the
