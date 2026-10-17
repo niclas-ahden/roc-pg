@@ -1,4 +1,4 @@
-## Reads a query's parse tree and checks it against a [Catalog]: that its
+## Reads a query's parse tree and checks it against a [Dump]: that its
 ## tables and columns exist, that parameters fit the columns they meet, and
 ## what its result columns are called, what type they have and whether they
 ## can be NULL.
@@ -7,7 +7,7 @@
 ## type is "unknown", a relation it cannot read makes its columns unknown,
 ## and unknown things are not checked. Only what it is sure of becomes a
 ## problem.
-import Catalog
+import Dump
 import Enums
 import Overload
 import PgType
@@ -36,7 +36,7 @@ Check :: [].{
 	## `col in ($a, $b)`, `col = any($names)`, `set col = $name` and the
 	## values of an `insert`. It must fit the column's type, and one that can
 	## be NULL cannot go into a `NOT NULL` column.
-	analyze : Node, Catalog, List(Check.Param), List({ at : I64, name : Str }) -> Check.Result
+	analyze : Node, Dump, List(Check.Param), List({ at : I64, name : Str }) -> Check.Result
 	analyze = |stmt, catalog, params, names| {
 		result = statement(stmt, { catalog, ctes: [], outer: [], params, names, grouped: Bool.False, group: NoGroup, enums: catalog.enums() })
 		{ ..result, problems: result.problems.fold([], |acc, p| if acc.contains(p) acc else acc.append(p)) }
@@ -46,7 +46,7 @@ Check :: [].{
 	## row field that decodes as `kind`: the field takes every value the
 	## column can hold (see [PgType.field_holds]), the bounds of a domain
 	## such as `u8` included.
-	fits : Catalog, Str, Str -> Bool
+	fits : Dump, Str, Str -> Bool
 	fits = |catalog, type, kind| PgType.field_holds(kind, values_in(catalog, type), base_in(catalog, type))
 
 	## A hint for a name that is probably a misspelling of one of `names`,
@@ -109,7 +109,7 @@ Cols : [Known(List(Check.Output)), Unknown]
 ## decides whether an aggregate can see no rows. `group` is what grouping
 ## lets the expressions being read refer to. `enums` are the schema's enum
 ## types.
-Env : { catalog : Catalog, ctes : List({ name : Str, columns : Cols }), outer : List(Rel), params : List(Check.Param), names : List({ at : I64, name : Str }), grouped : Bool, group : Group, enums : List(Str) }
+Env : { catalog : Dump, ctes : List({ name : Str, columns : Cols }), outer : List(Rel), params : List(Check.Param), names : List({ at : I64, name : Str }), grouped : Bool, group : Group, enums : List(Str) }
 
 ## What the select whose select list, `having` and `order by` are being
 ## read groups by: its `group by` expressions, the columns among them by
@@ -135,7 +135,7 @@ Typed : { output : Check.Output, arg : Overload.Arg, problems : List(Str), aggre
 ## same column of the other side.
 ## `not_null` are the columns a `where` clause keeps only rows where they
 ## are not NULL. `source` is the catalog's table for a table or view.
-Rel : { alias : Str, table : Str, columns : Cols, nullable : Bool, hidden : List(Str), not_null : List(Str), source : Try(Catalog.Table, [NotATable]) }
+Rel : { alias : Str, table : Str, columns : Cols, nullable : Bool, hidden : List(Str), not_null : List(Str), source : Try(Dump.Table, [NotATable]) }
 
 Lookup : [Found(Check.Output), Missing(Str), Unsure]
 
@@ -143,7 +143,7 @@ no_outputs : Check.Result
 no_outputs = { outputs: Unknown, problems: [] }
 
 ## The type a domain is of, or `type` itself.
-base_in : Catalog, Str -> Str
+base_in : Dump, Str -> Str
 base_in = |catalog, type|
 	if type.ends_with("[]") {
 		"${base_in(catalog, type.drop_suffix("[]"))}[]"
@@ -152,7 +152,7 @@ base_in = |catalog, type|
 	}
 
 ## The values a column of `type` holds, those of a bounded domain's range.
-values_in : Catalog, Str -> PgType.Values
+values_in : Dump, Str -> PgType.Values
 values_in = |catalog, type|
 	match catalog.domain(type) {
 		Ok({ bounds: Bounded(low, high), .. }) => Integers(low, high)
@@ -736,7 +736,7 @@ join = |j, env| {
 ## without is a CTE or the table of the first schema on the search path
 ## that has one, as `RangeVarGetRelid` finds it. An unknown name is a
 ## problem only when the catalog has tables to compare with.
-table_columns : Node.RangeVar, Env -> { columns : Cols, source : Try(Catalog.Table, [NotATable]), problems : List(Str) }
+table_columns : Node.RangeVar, Env -> { columns : Cols, source : Try(Dump.Table, [NotATable]), problems : List(Str) }
 table_columns = |r, env| {
 	name = r.relname ?? ""
 	schema =
@@ -1506,10 +1506,10 @@ sql_value_output = |v| {
 	{ name, type: Known(type), nullable: if v.op == Enums.svfop_current_schema Unknown else No }
 }
 
-## The type a `TypeName` names, spelled like [Catalog] spells column types.
+## The type a `TypeName` names, spelled like [Dump] spells column types.
 type_of : Node -> [Known(Str), Unknown]
 type_of = |node|
-	match Catalog.type_name(node) {
+	match Dump.type_name(node) {
 		"" => Unknown
 		type => Known(type)
 	}
@@ -2249,13 +2249,13 @@ test_schema =
 	\\CREATE FUNCTION public.school_members(o_id integer) RETURNS TABLE(student_id integer, student_name text)
 	\\    LANGUAGE sql AS $$ select 1, 'a' $$;
 
-test_catalog : Catalog
-test_catalog = Catalog.parse(test_schema) ?? Catalog.none
+test_catalog : Dump
+test_catalog = Dump.parse(test_schema) ?? Dump.none
 
 check : Str -> Check.Result
 check = |sql| check_in(test_catalog, sql)
 
-check_in : Catalog, Str -> Check.Result
+check_in : Dump, Str -> Check.Result
 check_in = |catalog, sql| {
 	toks = Lex.tokens(sql) ?? []
 	match Parse.parse(Lex.grammar_text(sql, toks)) {
@@ -2267,7 +2267,7 @@ check_in = |catalog, sql| {
 outputs : Str -> List(Str)
 outputs = |sql| outputs_in(test_catalog, sql)
 
-outputs_in : Catalog, Str -> List(Str)
+outputs_in : Dump, Str -> List(Str)
 outputs_in = |catalog, sql|
 	match check_in(catalog, sql).outputs {
 		Known(list) =>
@@ -2473,9 +2473,9 @@ expect outputs("select t.a, t.b from json_to_record('{}'::json) as t(a int, b te
 expect outputs("select g, ordinality from generate_series(1, 3) with ordinality as g") == ["g integer null?", "ordinality bigint"]
 expect outputs("select a, b from rows from (generate_series(1, 2), unnest(array['x'])) as t(a, b)") == ["a integer null?", "b text null?"]
 
-schemas_catalog : Catalog
+schemas_catalog : Dump
 schemas_catalog =
-	Catalog.parse(
+	Dump.parse(
 		\\CREATE TABLE public.users (id integer NOT NULL, name text NOT NULL);
 		\\CREATE TABLE app.users (id bigint NOT NULL, email text NOT NULL);
 		\\CREATE TABLE app.posts (id bigint NOT NULL, title text NOT NULL);
@@ -2484,7 +2484,7 @@ schemas_catalog =
 		\\CREATE AGGREGATE public.total(integer) (SFUNC = public.add_one, STYPE = integer);
 		\\CREATE FUNCTION public.everyone() RETURNS SETOF public.users LANGUAGE sql AS $$ select * from public.users $$;
 	)
-	?? Catalog.none
+	?? Dump.none
 
 # Tables and functions by schema and search path.
 expect outputs_in(schemas_catalog, "select id, name from users") == ["id integer", "name text"]

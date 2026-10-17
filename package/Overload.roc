@@ -9,7 +9,7 @@
 ## When the rules leave more than one candidate, there is no answer either,
 ## as the server would refuse the call as ambiguous.
 import Builtins
-import Catalog
+import Dump
 
 Overload :: [].{
 	## An argument as the resolution sees it: of a known type, of no type
@@ -41,12 +41,12 @@ Overload :: [].{
 	## The function `name` called with `args`, from the built in ones and
 	## `schema_functions`, those of the app's schema. `enums` are the
 	## schema's enum types, for `anyenum`.
-	function : Str, List(Overload.Arg), List(Str), List(Catalog.Function) -> Try(Overload.Choice, Overload.Miss)
+	function : Str, List(Overload.Arg), List(Str), List(Dump.Function) -> Try(Overload.Choice, Overload.Miss)
 	function = |name, args, enums, schema_functions| Overload.function_from(name, args, enums, Bool.True, schema_functions)
 
 	## [Overload.function], from the built in functions only when
 	## `builtins`, as for a call that names no schema or `pg_catalog`.
-	function_from : Str, List(Overload.Arg), List(Str), Bool, List(Catalog.Function) -> Try(Overload.Choice, Overload.Miss)
+	function_from : Str, List(Overload.Arg), List(Str), Bool, List(Dump.Function) -> Try(Overload.Choice, Overload.Miss)
 	function_from = |name, args, enums, builtins, schema_functions| {
 		arity = args.len()
 		builtin = if builtins lines_named(Builtins.functions, name).keep_oks(builtin_declared) else []
@@ -215,7 +215,7 @@ builtin_declared = |fields|
 
 ## A function of the app's schema. One with several output columns returns
 ## `record`.
-schema_declared : Catalog.Function -> Declared
+schema_declared : Dump.Function -> Declared
 schema_declared = |f| { name: f.name, args: f.args, defaults: f.defaults, variadic: f.variadic, result: f.result, strict: f.strict, kind: if f.aggregate Aggregate else Plain, set: f.set, outputs: f.outputs }
 
 ## The declared function as a candidate for a call with `arity` arguments.
