@@ -496,12 +496,7 @@ Client(stream, schema) :: {
 			row.parser_for : RowFormat -> (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)),
 		]
 	query_one! = |client, sql, params| {
-		Params : params
-		Row : row
-		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
-		fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| PgDecodeErr("a field of the row type is a record, which a result row cannot fill")
-		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, named)?
-		match decode_rows(result, Row.parser_for(RowFormat.Text))? {
+		match Client.query!(client, sql, params)? {
 			[] => Err(EmptyResult)
 			[row] => Ok(row)
 			rows => Err(MultipleRows(rows.len()))
@@ -524,12 +519,7 @@ Client(stream, schema) :: {
 			row.parser_for : RowFormat -> (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)),
 		]
 	query_optional! = |client, sql, params| {
-		Params : params
-		Row : row
-		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
-		fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| PgDecodeErr("a field of the row type is a record, which a result row cannot fill")
-		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, named)?
-		match decode_rows(result, Row.parser_for(RowFormat.Text))? {
+		match Client.query!(client, sql, params)? {
 			[] => Ok(Err(NotFound))
 			[row] => Ok(Ok(row))
 			rows => Err(MultipleRows(rows.len()))
