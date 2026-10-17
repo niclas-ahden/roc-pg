@@ -37,7 +37,7 @@ Check :: [].{
 	## be NULL cannot go into a `NOT NULL` column.
 	analyze : Node, Catalog, List(Check.Param), List({ at : I64, name : Str }) -> Check.Result
 	analyze = |stmt, catalog, params, names| {
-		result = statement(stmt, { catalog, ctes: [], outer: [], params, names, grouped: Bool.False, enums: catalog.enums() })
+		result = statement(stmt, { catalog, ctes: [], outer: [], params, names, grouped: Bool.False, group: NoGroup, enums: catalog.enums() })
 		{ ..result, problems: result.problems.fold([], |acc, p| if acc.contains(p) acc else acc.append(p)) }
 	}
 
@@ -156,9 +156,29 @@ smaller = |x, y| if x < y x else y
 Cols : [Known(List(Check.Output)), Unknown]
 
 ## `grouped` is whether the select being read has a `group by`, which
-## decides whether an aggregate can see no rows. `enums` are the schema's
-## enum types.
-Env : { catalog : Catalog, ctes : List({ name : Str, columns : Cols }), outer : List(Rel), params : List(Check.Param), names : List({ at : I64, name : Str }), grouped : Bool, enums : List(Str) }
+## decides whether an aggregate can see no rows. `group` is what grouping
+## lets the expressions being read refer to. `enums` are the schema's enum
+## types.
+Env : { catalog : Catalog, ctes : List({ name : Str, columns : Cols }), outer : List(Rel), params : List(Check.Param), names : List({ at : I64, name : Str }), grouped : Bool, group : Group, enums : List(Str) }
+
+## What the select whose select list, `having` and `order by` are being
+## read groups by: its `group by` expressions, the columns among them by
+## relation and column name, and the relations whose primary key is grouped
+## by, all of whose columns may be read. `NoGroup` for every other clause,
+## and for a select with grouping sets, which are left to the server.
+Group : [NoGroup, Group({ exprs : List(Node), keys : List((Str, Str)), covered : List(Str) })]
+
+## What one walk over an expression learns, bottom up, so that each node
+## is read once however deep the expression is.
+##
+## - `output`: its name, type and nullability as a result column.
+## - `arg`: it as an argument for picking a function or operator.
+## - `problems`: columns that do not exist, calls that nothing takes,
+##   parameters that do not fit, and what subqueries in it find.
+## - `aggregate`: whether it calls an aggregate outside a subquery.
+## - `ungrouped`: the column references in it that the select's grouping
+##   does not allow, as written.
+Typed : { output : Check.Output, arg : Overload.Arg, problems : List(Str), aggregate : Bool, ungrouped : List(Str) }
 
 ## A relation of a query. `hidden` are the columns an unqualified reference
 ## does not see, because a `using` or `natural` join merged them into the
@@ -198,7 +218,9 @@ allowed_types = |kind|
 	}
 
 statement : Node, Env -> Check.Result
-statement = |node, env|
+statement = |node, outer_env| {
+	# Grouping is the business of the select it belongs to.
+	env = { ..outer_env, group: NoGroup }
 	match node {
 		RawStmt(raw) => statement(raw.stmt, env)
 		SelectStmt(s) => select_stmt(s, env)
@@ -208,6 +230,7 @@ statement = |node, env|
 		MergeStmt(s) => merge_stmt(s, env)
 		_ => no_outputs
 	}
+}
 
 ## The common table expressions of a `with` clause, added to `env`.
 with_env : Node, Env -> { env : Env, problems : List(Str) }
@@ -325,16 +348,16 @@ values_select = |lists, env| {
 				_ => []
 			},
 	)
-	problems = rows.fold([], |acc, items| items.fold(acc, |inner, item| inner.concat(expression_problems(item, [], env))))
+	cells = rows.map(|items| items.map(|item| typed(item, [], env)))
+	problems = cells.fold([], |acc, row| row.fold(acc, |inner, cell| inner.concat(cell.problems)))
 	outputs =
-		match rows.first() {
+		match cells.first() {
 			Ok(first) =>
 				Known(
 					first.map_with_index(
-						|item, i| {
-							output = expr_output(item, [], env)
-							nullable = merge_nullable(rows.map(|row| row.get(i).map_ok(|cell| expr_output(cell, [], env).nullable) ?? Unknown))
-							{ ..output, name: "column${(i + 1).to_str()}", nullable }
+						|cell, i| {
+							nullable = merge_nullable(cells.map(|row| row.get(i).map_ok(|other| other.output.nullable) ?? Unknown))
+							{ ..cell.output, name: "column${(i + 1).to_str()}", nullable }
 						},
 					),
 				)
@@ -345,10 +368,12 @@ values_select = |lists, env| {
 
 simple_select : Node.SelectStmt, Env -> Check.Result
 simple_select = |s, outer_env| {
-	{ rels, problems: from_problems } = from_list(s.from_clause, { ..outer_env, grouped: Bool.False })
-	env = { ..outer_env, grouped: !s.group_clause.is_empty() }
+	plain = { ..outer_env, grouped: Bool.False, group: NoGroup }
+	{ rels, problems: from_problems } = from_list(s.from_clause, plain)
+	clause_env = { ..plain, grouped: !s.group_clause.is_empty() }
+	env = { ..clause_env, group: group_of(s, rels, clause_env) }
 	# The rows `where` keeps have no NULL in the columns it rules NULL out.
-	{ outputs, problems: target_problems } = target_list(s.target_list, narrowed(rels, s.where_clause), env)
+	selected = target_list(s.target_list, narrowed(rels, s.where_clause), env)
 	aliases = s.target_list.keep_oks(
 		|target|
 			match target {
@@ -356,60 +381,26 @@ simple_select = |s, outer_env| {
 				_ => Err(NoAlias)
 			},
 	)
+	having = typed(s.having_clause, rels, env)
+	distinct = s.distinct_clause.map(|item| output_ref(item, aliases, rels, env))
+	sorted = s.sort_clause.map(|item| output_ref(item, aliases, rels, env))
 	clause_problems =
-		expression_problems(s.where_clause, rels, env)
-			.concat(s.group_clause.fold([], |acc, item| acc.concat(output_ref_problems(item, aliases, rels, env))))
-			.concat(expression_problems(s.having_clause, rels, env))
-			.concat(s.distinct_clause.fold([], |acc, item| acc.concat(output_ref_problems(item, aliases, rels, env))))
-			.concat(s.sort_clause.fold([], |acc, item| acc.concat(output_ref_problems(item, aliases, rels, env))))
-			.concat(s.window_clause.fold([], |acc, item| acc.concat(expression_problems(item, rels, env))))
-			.concat(expression_problems(s.limit_count, rels, env))
-			.concat(expression_problems(s.limit_offset, rels, env))
-	{ outputs, problems: from_problems.concat(target_problems).concat(clause_problems).concat(group_problems(s, rels, env)) }
+		expression_problems(s.where_clause, rels, clause_env)
+			.concat(s.group_clause.fold([], |acc, item| acc.concat(output_ref(item, aliases, rels, clause_env).problems)))
+			.concat(having.problems)
+			.concat(distinct.fold([], |acc, item| acc.concat(item.problems)))
+			.concat(sorted.fold([], |acc, item| acc.concat(item.problems)))
+			.concat(s.window_clause.fold([], |acc, item| acc.concat(expression_problems(item, rels, clause_env))))
+			.concat(expression_problems(s.limit_count, rels, clause_env))
+			.concat(expression_problems(s.limit_offset, rels, clause_env))
+	# A select that groups, by `group by` or by calling an aggregate, reads a
+	# column outside an aggregate only when it is grouped by, or its table's
+	# primary key is, or the whole expression it is in is.
+	grouped = !s.group_clause.is_empty() or selected.aggregate or having.aggregate
+	ungrouped = if grouped selected.ungrouped.concat(having.ungrouped).concat(sorted.concat(distinct).fold([], |acc, item| acc.concat(item.ungrouped))) else []
+	group_problems = ungrouped.map(|ref| "column `${ref}` must appear in `group by` or be used in an aggregate")
+	{ outputs: selected.outputs, problems: from_problems.concat(selected.problems).concat(clause_problems).concat(group_problems) }
 }
-
-## The sub-expressions of an expression, not looking into subqueries.
-expr_children : Node -> List(Node)
-expr_children = |node|
-	match node {
-		AExpr(a) => [a.lexpr, a.rexpr]
-		BoolExpr(b) => b.args
-		NodeList(items) => items
-		FuncCall(f) => f.args.concat(f.agg_order).concat([f.agg_filter, f.over])
-		NamedArgExpr(n) => [n.arg]
-		TypeCast(t) => [t.arg]
-		CollateClause(c) => [c.arg]
-		NullTest(t) => [t.arg]
-		BooleanTest(t) => [t.arg]
-		CoalesceExpr(c) => c.args
-		MinMaxExpr(m) => m.args
-		CaseExpr(c) => [c.arg, c.defresult].concat(c.args)
-		CaseWhen(w) => [w.expr, w.result]
-		AArrayExpr(a) => a.elements
-		RowExpr(r) => r.args
-		AIndirection(i) => [i.arg].concat(i.indirection)
-		AIndices(i) => [i.lidx, i.uidx]
-		SortBy(s) => [s.node]
-		WindowDef(w) => w.partition_clause.concat(w.order_clause)
-		ResTarget(t) => [t.val]
-		_ => []
-	}
-
-## Whether `node` is a call of an aggregate, not over a window.
-is_aggregate_call : Node, List(Rel), Env -> Bool
-is_aggregate_call = |node, rels, env|
-	match node {
-		FuncCall(f) if f.over == Null =>
-			match function_choice(f, rels, env) {
-				Ok({ kind: Aggregate, .. }) => Bool.True
-				_ => Bool.False
-			}
-		_ => Bool.False
-	}
-
-## Whether an expression calls an aggregate outside a subquery.
-has_aggregate : Node, List(Rel), Env -> Bool
-has_aggregate = |node, rels, env| is_aggregate_call(node, rels, env) or expr_children(node).any(|child| has_aggregate(child, rels, env))
 
 ## The relation of this query a column reference reads, if it reads one.
 owner : Ref, List(Rel) -> Try(Rel, [NotOwned])
@@ -427,13 +418,10 @@ owner = |ref, rels|
 			}
 	}
 
-## A select that groups, by `group by` or by calling an aggregate, reads a
-## column outside an aggregate only when it is grouped by, or its table's
-## primary key is, or the whole expression it is in is. Grouping sets, and
-## calls of functions this does not know (they could be aggregates), are
-## left to the server.
-group_problems : Node.SelectStmt, List(Rel), Env -> List(Str)
-group_problems = |s, rels, env| {
+## What a select groups by, for reading its select list, `having` and
+## `order by`. Grouping sets are left to the server.
+group_of : Node.SelectStmt, List(Rel), Env -> Group
+group_of = |s, rels, env| {
 	simple_items =
 		s.group_clause.all(
 			|item|
@@ -442,9 +430,8 @@ group_problems = |s, rels, env| {
 					_ => Bool.True
 				},
 		)
-	grouped = !s.group_clause.is_empty() or s.target_list.any(|t| has_aggregate(t, rels, env)) or has_aggregate(s.having_clause, rels, env)
-	if !simple_items or !grouped {
-		[]
+	if !simple_items {
+		NoGroup
 	} else {
 		selected = s.target_list.keep_oks(
 			|t|
@@ -488,79 +475,26 @@ group_problems = |s, rels, env| {
 					_ => Bool.False
 				},
 		).map(|r| r.alias)
-		ungrouped = |node|
-			ungrouped_refs(node, group_exprs, keys, covered, rels, env)
-		aliases = selected.keep_oks(|t| t.name.map_err(|_| NoAlias))
-		sorted = s.sort_clause.concat(s.distinct_clause).fold(
-			[],
-			|acc, item|
-				match item {
-					SortBy({ node: AConst(_), .. }) => acc
-					SortBy({ node: ColumnRef({ fields: [String({ sval: Ok(name) })], .. }), .. }) if aliases.contains(name) => acc
-					other => acc.concat(ungrouped(other))
-				},
-		)
-		refs = selected.fold([], |acc, t| acc.concat(ungrouped(t.val))).concat(ungrouped(s.having_clause)).concat(sorted)
-		refs.map(|ref| "column `${ref}` must appear in `group by` or be used in an aggregate")
+		Group({ exprs: group_exprs, keys, covered })
 	}
 }
 
 has_column_named : List(Rel), Str -> Bool
 has_column_named = |rels, name| rels.any(|r| visible_names(r).contains(name))
 
-## The column references in `node` that grouping does not allow, as
-## written.
-ungrouped_refs : Node, List(Node), List((Str, Str)), List(Str), List(Rel), Env -> List(Str)
-ungrouped_refs = |node, group_exprs, keys, covered, rels, env|
-	if group_exprs.any(|g| Node.equal(g, node)) {
-		[]
-	} else {
-		match node {
-			ColumnRef(c) =>
-				match column_ref(c) {
-					Ok(ref) =>
-						match owner(ref, rels) {
-							Ok(rel) if !keys.contains((rel.alias, ref.name)) and !covered.contains(rel.alias) =>
-								match ref.qualifier {
-									Some(q) => ["${q}.${ref.name}"]
-									None => [ref.name]
-								}
-							_ => []
-						}
-					Err(_) => []
-				}
-			FuncCall(f) =>
-				if is_aggregate_call(node, rels, env) {
-					[]
-				} else {
-					match function_choice(f, rels, env) {
-						# A function this does not know could be an aggregate.
-						Err(_) => []
-						Ok(_) => expr_children(node).fold([], |acc, child| acc.concat(ungrouped_refs(child, group_exprs, keys, covered, rels, env)))
-					}
-				}
-			SubLink(_) => []
-			GroupingFunc(_) => []
-			_ => expr_children(node).fold([], |acc, child| acc.concat(ungrouped_refs(child, group_exprs, keys, covered, rels, env)))
-		}
-	}
-
-## Problems of an `order by`, `group by` or `distinct on` item, which may
-## also name an output column by its alias.
-output_ref_problems : Node, List(Str), List(Rel), Env -> List(Str)
-output_ref_problems = |item, aliases, rels, env| {
+## An `order by`, `group by` or `distinct on` item, which may also name an
+## output column by its alias, or one by its position.
+output_ref : Node, List(Str), List(Rel), Env -> Typed
+output_ref = |item, aliases, rels, env| {
 	inner =
 		match item {
 			SortBy(sort) => sort.node
 			_ => item
 		}
 	match inner {
-		ColumnRef(c) =>
-			match c.fields {
-				[only] if aliases.contains(string_of(only) ?? "") => []
-				_ => expression_problems(inner, rels, env)
-			}
-		_ => expression_problems(inner, rels, env)
+		ColumnRef({ fields: [only], .. }) if aliases.contains(string_of(only) ?? "") => leaf(unknown_output)
+		AConst(_) => { ..typed(inner, rels, env), ungrouped: [] }
+		_ => typed(inner, rels, env)
 	}
 }
 
@@ -604,13 +538,20 @@ from_item = |node, env|
 					Ok(FuncCall(call)) => names_of(call.funcname).last() ?? "?"
 					_ => "?"
 				}
-			problems = calls.fold([], |acc, call| acc.concat(expression_problems(call, [], env)))
+			walked = calls.map(
+				|c|
+					match c {
+						FuncCall(f) => call(f, [], env)
+						other => { typed: typed(other, [], env), choice: Err(NoChoice) }
+					},
+			)
+			problems = walked.fold([], |acc, w| acc.concat(w.typed.problems))
 			# One function that returns a type of one column gives one column,
 			# named after the alias, or the function without one.
 			columns =
-				match calls {
-					[FuncCall(call)] if !r.ordinality =>
-						match function_choice(call, [], env) {
+				match walked {
+					[only] if !r.ordinality =>
+						match only.choice {
 							Ok({ outputs: [_, ..] as outputs, .. }) => Known(outputs.map(|o| { name: o.name, type: Known(o.type), nullable: Unknown }))
 							Ok({ result: Known(type), .. }) if Overload.category(type, env.enums) != 'C' => {
 								column =
@@ -699,54 +640,58 @@ table_columns = |name, env, qualified| {
 	}
 }
 
+## The outputs of a select or `returning` list, with what its items found.
+Targets : { outputs : Cols, problems : List(Str), aggregate : Bool, ungrouped : List(Str) }
+
 ## The outputs of a select or `returning` list.
-target_list : List(Node), List(Rel), Env -> { outputs : Cols, problems : List(Str) }
-target_list = |items, rels, env| {
-	var $outputs = Known([])
-	var $problems = []
-	for target in items {
-		{ outputs, problems } = target_item(target, rels, env)
-		$problems = $problems.concat(problems)
-		$outputs =
-			match ($outputs, outputs) {
-				(Known(so_far), Known(more)) => Known(so_far.concat(more))
-				_ => Unknown
-			}
-	}
-	{ outputs: $outputs, problems: $problems }
-}
+target_list : List(Node), List(Rel), Env -> Targets
+target_list = |items, rels, env|
+	items.fold(
+		{ outputs: Known([]), problems: [], aggregate: Bool.False, ungrouped: [] },
+		|acc, target| {
+			item = target_item(target, rels, env)
+			outputs =
+				match (acc.outputs, item.outputs) {
+					(Known(so_far), Known(more)) => Known(so_far.concat(more))
+					_ => Unknown
+				}
+			{ outputs, problems: acc.problems.concat(item.problems), aggregate: acc.aggregate or item.aggregate, ungrouped: acc.ungrouped.concat(item.ungrouped) }
+		},
+	)
 
 ## One item of a select list, which `*` and `alias.*` expand into many.
-target_item : Node, List(Rel), Env -> { outputs : Cols, problems : List(Str) }
-target_item = |target, rels, env|
+target_item : Node, List(Rel), Env -> Targets
+target_item = |target, rels, env| {
+	columns = |outputs, problems| { outputs, problems, aggregate: Bool.False, ungrouped: [] }
 	match target {
 		ResTarget(t) =>
 			match star_of(t.val) {
 				Ok(AllRels) => {
 					all = rels.map(rel_outputs)
 					if all.all(|o| o != Unknown) {
-						{ outputs: Known(all.fold([], |acc, o| acc.concat(known_list(o)))), problems: [] }
+						columns(Known(all.fold([], |acc, o| acc.concat(known_list(o)))), [])
 					} else {
-						{ outputs: Unknown, problems: [] }
+						columns(Unknown, [])
 					}
 				}
 				Ok(OneRel(alias)) =>
 					match find_rel(rels.concat(env.outer), alias) {
-						Ok(rel) => { outputs: rel_outputs(rel), problems: [] }
-						Err(_) => { outputs: Unknown, problems: ["`${alias}.*` names no table of the query"] }
+						Ok(rel) => columns(rel_outputs(rel), [])
+						Err(_) => columns(Unknown, ["`${alias}.*` names no table of the query"])
 					}
 				Err(_) => {
-					output = expr_output(t.val, rels, env)
+					value = typed(t.val, rels, env)
 					named =
 						match t.name {
-							Ok(name) => { ..output, name }
-							Err(_) => output
+							Ok(name) => { ..value.output, name }
+							Err(_) => value.output
 						}
-					{ outputs: Known([named]), problems: expression_problems(t.val, rels, env) }
+					{ outputs: Known([named]), problems: value.problems, aggregate: value.aggregate, ungrouped: value.ungrouped }
 				}
 			}
-		_ => { outputs: Unknown, problems: [] }
+		_ => columns(Unknown, [])
 	}
+}
 
 ## `*` for every relation, or `alias.*` for one.
 star_of : Node -> Try([AllRels, OneRel(Str)], [NotAStar])
@@ -807,7 +752,7 @@ not_null_refs = |node| {
 				direct([a.lexpr, a.rexpr])
 			} else if [Enums.aexpr_op_any, Enums.aexpr_op_all, Enums.aexpr_in, Enums.aexpr_like, Enums.aexpr_ilike, Enums.aexpr_similar].contains(a.kind) {
 				direct([a.lexpr])
-			} else if a.kind >= 10 and a.kind <= 13 {
+			} else if a.kind >= Enums.aexpr_between and a.kind <= Enums.aexpr_not_between_sym {
 				direct([a.lexpr])
 			} else {
 				[]
@@ -842,57 +787,93 @@ known_list = |outputs|
 visible_names : Rel -> List(Str)
 visible_names = |rel| known_list(rel.columns).map(|c| c.name).drop_if(|name| rel.hidden.contains(name))
 
-## The name, type and nullability of an expression's value. The name is the
-## one Postgres gives a result column that has no alias.
-expr_output : Node, List(Rel), Env -> Check.Output
-expr_output = |node, rels, env| {
-	unknown = { name: "?column?", type: Unknown, nullable: Unknown }
+unknown_output : Check.Output
+unknown_output = { name: "?column?", type: Unknown, nullable: Unknown }
+
+## The problems in an expression. See [Typed].
+expression_problems : Node, List(Rel), Env -> List(Str)
+expression_problems = |node, rels, env| typed(node, rels, env).problems
+
+## Walk an expression once. The name in its output is the one Postgres
+## gives a result column that has no alias.
+typed : Node, List(Rel), Env -> Typed
+typed = |node, rels, env| {
+	walked = walk(node, rels, env)
+	match env.group {
+		# An expression the select groups by may be read whole.
+		Group(g) if g.exprs.any(|e| Node.equal(e, node)) => { ..walked, ungrouped: [] }
+		_ => walked
+	}
+}
+
+walk : Node, List(Rel), Env -> Typed
+walk = |node, rels, env| {
+	sub = |child| typed(child, rels, env)
+	subs = |children| children.map(sub)
 	match node {
 		ColumnRef(c) =>
 			match column_ref(c) {
-				Ok(ref) =>
-					match resolve(ref, rels, env) {
-						Found(found) => { ..found, name: ref.name }
-						_ => { ..unknown, name: ref.name }
-					}
-				Err(_) => unknown
+				Ok(ref) => {
+					lookup = resolve(ref, rels, env)
+					output =
+						match lookup {
+							Found(found) => { ..found, name: ref.name }
+							_ => { ..unknown_output, name: ref.name }
+						}
+					problems =
+						match lookup {
+							Missing(problem) => [problem]
+							_ => []
+						}
+					{ ..leaf(output), problems, ungrouped: ungrouped_column(ref, rels, env) }
+				}
+				Err(_) => leaf(unknown_output)
 			}
-		TypeCast(t) => {
-			inner = expr_output(t.arg, rels, env)
-			name = if inner.name == "?column?" type_last_name(t.type_name) else inner.name
-			{ name, type: type_of(t.type_name), nullable: inner.nullable }
-		}
-		CollateClause(c) => expr_output(c.arg, rels, env)
+		ParamRef(_) => { ..leaf(unknown_output), arg: Untyped }
 		AConst(c) =>
 			if c.isnull {
-				{ ..unknown, nullable: Yes }
+				{ ..leaf({ ..unknown_output, nullable: Yes }), arg: Untyped }
 			} else {
-				{ ..unknown, type: const_type(c.val), nullable: No }
+				value = leaf({ ..unknown_output, type: const_type(c.val), nullable: No })
+				match c.val {
+					String(_) => { ..value, arg: Untyped }
+					_ => value
+				}
 			}
-		FuncCall(f) => func_output(f, rels, env)
-		SubLink(s) => sublink_output(s, rels, env)
+		TypeCast(t) => {
+			inner = sub(t.arg)
+			name = if inner.output.name == "?column?" type_last_name(t.type_name) else inner.output.name
+			value = over({ name, type: type_of(t.type_name), nullable: inner.output.nullable }, [inner])
+			{ ..value, problems: cast_param_problems(t, env).concat(inner.problems) }
+		}
+		CollateClause(c) => {
+			inner = sub(c.arg)
+			over(inner.output, [inner])
+		}
+		FuncCall(f) => call(f, rels, env).typed
+		SubLink(s) => sublink(s, rels, env)
 		CoalesceExpr(c) => {
-			args = c.args.map(|arg| expr_output(arg, rels, env))
-			{ name: "coalesce", type: common_type(args), nullable: first_non_null(args) }
+			args = subs(c.args)
+			outputs = args.map(|a| a.output)
+			over({ name: "coalesce", type: common_type(outputs), nullable: first_non_null(outputs) }, args)
 		}
 		MinMaxExpr(m) => {
-			args = m.args.map(|arg| expr_output(arg, rels, env))
-			{ name: if m.op == Enums.is_greatest "greatest" else "least", type: common_type(args), nullable: first_non_null(args) }
+			args = subs(m.args)
+			outputs = args.map(|a| a.output)
+			over({ name: if m.op == Enums.is_greatest "greatest" else "least", type: common_type(outputs), nullable: first_non_null(outputs) }, args)
 		}
 		CaseExpr(c) => {
-			results = c.args.keep_oks(
+			arms = c.args.map(
 				|arm|
 					match arm {
-						CaseWhen(w) => Ok(expr_output(w.result, rels, env))
-						_ => Err(NotAnArm)
+						CaseWhen(w) => { condition: sub(w.expr), result: Ok(sub(w.result)) }
+						other => { condition: sub(other), result: Err(NotAnArm) }
 					},
 			)
-			otherwise =
-				match c.defresult {
-					Null => { ..unknown, nullable: Yes }
-					other => expr_output(other, rels, env)
-				}
-			all = results.append(otherwise)
+			otherwise = sub(c.defresult)
+			results = arms.keep_oks(|arm| arm.result).map(|r| r.output)
+			default_output = if c.defresult == Null { ..unknown_output, nullable: Yes } else otherwise.output
+			all = results.append(default_output)
 			# A branch that reads a column that can be NULL may only run when it
 			# is not, as in `case when x is null then 0 else x end`. So only a
 			# bare NULL, or no `else`, makes the case NULL for sure.
@@ -904,19 +885,73 @@ expr_output = |node, rels, env| {
 				} else {
 					Unknown
 				}
-			{ name: "case", type: common_type(all), nullable }
+			children = [sub(c.arg)].concat(arms.fold([], |acc, arm| acc.append(arm.condition).concat(arm.result.map_ok(|r| [r]) ?? []))).append(otherwise)
+			over({ name: "case", type: common_type(all), nullable }, children)
 		}
-		AArrayExpr(_) => { ..unknown, name: "array", nullable: No }
-		RowExpr(_) => { ..unknown, name: "row", nullable: No }
-		AExpr(a) => aexpr_output(a, rels, env)
-		BoolExpr(b) => { ..unknown, type: Known("boolean"), nullable: all_not_null(b.args.map(|arg| expr_output(arg, rels, env))) }
-		NullTest(_) => { ..unknown, type: Known("boolean"), nullable: No }
-		BooleanTest(_) => { ..unknown, type: Known("boolean"), nullable: No }
-		SQLValueFunction(v) => sql_value_output(v)
-		GroupingFunc(_) => { name: "grouping", type: Known("integer"), nullable: No }
-		_ => unknown
+		AArrayExpr(a) => over({ ..unknown_output, name: "array", nullable: No }, subs(a.elements))
+		RowExpr(r) => over({ ..unknown_output, name: "row", nullable: No }, subs(r.args))
+		AExpr(a) => operator(a, rels, env)
+		BoolExpr(b) => {
+			args = subs(b.args)
+			over({ ..unknown_output, type: Known("boolean"), nullable: all_not_null(args.map(|a| a.output)) }, args)
+		}
+		NullTest(t) => over({ ..unknown_output, type: Known("boolean"), nullable: No }, [sub(t.arg)])
+		BooleanTest(t) => over({ ..unknown_output, type: Known("boolean"), nullable: No }, [sub(t.arg)])
+		SQLValueFunction(v) => leaf(sql_value_output(v))
+		GroupingFunc(g) => { ..over({ name: "grouping", type: Known("integer"), nullable: No }, subs(g.args)), ungrouped: [] }
+		NamedArgExpr(n) => over(unknown_output, [sub(n.arg)])
+		NodeList(items) => over(unknown_output, subs(items))
+		CaseWhen(w) => over(unknown_output, [sub(w.expr), sub(w.result)])
+		AIndirection(i) => over(unknown_output, [sub(i.arg)].concat(subs(i.indirection)))
+		AIndices(i) => over(unknown_output, [sub(i.lidx), sub(i.uidx)])
+		SortBy(s) => over(unknown_output, [sub(s.node)])
+		WindowDef(w) => over(unknown_output, subs(w.partition_clause.concat(w.order_clause).concat([w.start_offset, w.end_offset])))
+		ResTarget(t) => over(unknown_output, [sub(t.val)])
+		MultiAssignRef(m) => over(unknown_output, [sub(m.source)])
+		GroupingSet(g) => over(unknown_output, subs(g.content))
+		_ => leaf(unknown_output)
 	}
 }
+
+## An expression with nothing under it.
+leaf : Check.Output -> Typed
+leaf = |output| { output, arg: type_arg(output.type), problems: [], aggregate: Bool.False, ungrouped: [] }
+
+## An expression over `children`, with what they found.
+over : Check.Output, List(Typed) -> Typed
+over = |output, children| {
+	output,
+	arg: type_arg(output.type),
+	problems: children.fold([], |acc, c| acc.concat(c.problems)),
+	aggregate: children.any(|c| c.aggregate),
+	ungrouped: children.fold([], |acc, c| acc.concat(c.ungrouped)),
+}
+
+## An expression of `type` as an argument for picking a function or
+## operator.
+type_arg : [Known(Str), Unknown] -> Overload.Arg
+type_arg = |type|
+	match type {
+		Known(t) => Known(t)
+		Unknown => Unsure
+	}
+
+## A column reference, as written, when the select groups and does not
+## group by it or its table's primary key.
+ungrouped_column : Ref, List(Rel), Env -> List(Str)
+ungrouped_column = |ref, rels, env|
+	match env.group {
+		Group(g) =>
+			match owner(ref, rels) {
+				Ok(rel) if !g.keys.contains((rel.alias, ref.name)) and !g.covered.contains(rel.alias) =>
+					match ref.qualifier {
+						Some(q) => ["${q}.${ref.name}"]
+						None => [ref.name]
+					}
+				_ => []
+			}
+		NoGroup => []
+	}
 
 ## The type of a constant. An integer too big for `integer` is a `Float`
 ## node in the raw tree.
@@ -936,9 +971,9 @@ const_type = |val|
 ## The type all of `outputs` share, leaving out bare NULLs.
 common_type : List(Check.Output) -> [Known(Str), Unknown]
 common_type = |outputs| {
-	typed = outputs.drop_if(|o| o.type == Unknown and o.nullable == Yes)
-	match typed.first() {
-		Ok(first) if typed.all(|o| o.type == first.type) => first.type
+	typed_outputs = outputs.drop_if(|o| o.type == Unknown and o.nullable == Yes)
+	match typed_outputs.first() {
+		Ok(first) if typed_outputs.all(|o| o.type == first.type) => first.type
 		_ => Unknown
 	}
 }
@@ -959,55 +994,62 @@ all_not_null = |args| if args.all(|a| a.nullable == No) No else Unknown
 
 comparison_ops = ["=", "<>", "!=", "<", ">", "<=", ">="]
 
-aexpr_output : Node.AExpr, List(Rel), Env -> Check.Output
-aexpr_output = |a, rels, env| {
-	unknown = { name: "?column?", type: Unknown, nullable: Unknown }
-	operands = operand_outputs(a, rels, env)
-	if a.kind == Enums.aexpr_nullif {
-		# nullif(a, b)
-		left = expr_output(a.lexpr, rels, env)
-		{ name: "nullif", type: left.type, nullable: Yes }
-	} else if a.kind == Enums.aexpr_distinct or a.kind == Enums.aexpr_not_distinct {
-		# is [not] distinct from
-		{ ..unknown, type: Known("boolean"), nullable: No }
-	} else if a.kind != Enums.aexpr_op or comparison_ops.contains(op_name(a)) {
-		# Comparisons, any/all, in, like, similar and between.
-		{ ..unknown, type: Known("boolean"), nullable: all_not_null(operands) }
-	} else {
-		operator_output(a, operands, rels, env)
-	}
+## An operator, `any`, `all`, `in`, `like`, `between`, `nullif` and `is
+## [not] distinct from`.
+operator : Node.AExpr, List(Rel), Env -> Typed
+operator = |a, rels, env| {
+	side = |node|
+		match node {
+			Null => []
+			NodeList(items) => items.map(|item| typed(item, rels, env))
+			other => [typed(other, rels, env)]
+		}
+	lefts = side(a.lexpr)
+	rights = side(a.rexpr)
+	operands = lefts.concat(rights)
+	outputs = operands.map(|o| o.output)
+	comparison = comparison_ops.contains(op_name(a))
+	# A comparison is boolean whatever operator it picks, so the pick is
+	# only needed to refuse one that nothing takes.
+	choice = if a.kind == Enums.aexpr_op and (!comparison or refuses_calls(env)) operator_choice(a, lefts, rights, env) else Err(NoChoice)
+	output =
+		if a.kind == Enums.aexpr_nullif {
+			# nullif(a, b)
+			{ name: "nullif", type: lefts.first().map_ok(|l| l.output.type) ?? Unknown, nullable: Yes }
+		} else if a.kind == Enums.aexpr_distinct or a.kind == Enums.aexpr_not_distinct {
+			# is [not] distinct from
+			{ ..unknown_output, type: Known("boolean"), nullable: No }
+		} else if a.kind != Enums.aexpr_op or comparison {
+			# Comparisons, any/all, in, like, similar and between.
+			{ ..unknown_output, type: Known("boolean"), nullable: all_not_null(outputs) }
+		} else {
+			match choice {
+				Ok(c) => { ..unknown_output, type: c.result, nullable: operator_nullable(c, outputs, env) }
+				Err(_) => unknown_output
+			}
+		}
+	value = over(output, operands)
+	own = operator_call_problems(a, lefts, rights, choice, env).concat(comparison_problems(a, rels, env)).concat(operator_param_problems(a, lefts, rights, choice, env))
+	{ ..value, problems: own.concat(value.problems) }
 }
-
-operand_outputs : Node.AExpr, List(Rel), Env -> List(Check.Output)
-operand_outputs = |a, rels, env|
-	[a.lexpr, a.rexpr]
-		.fold(
-			[],
-			|acc, side|
-				match side {
-					Null => acc
-					NodeList(items) => acc.concat(items)
-					other => acc.append(other)
-				},
-		)
-		.map(|operand| expr_output(operand, rels, env))
 
 op_name : Node.AExpr -> Str
 op_name = |a| names_of(a.name).last() ?? ""
 
-## The operator the server would pick for `a`.
-operator_choice : Node.AExpr, List(Rel), Env -> Try(Overload.Choice, Overload.Miss)
-operator_choice = |a, rels, env|
-	match a.lexpr {
-		Null => Overload.operator(op_name(a), Prefix, arg_of(a.rexpr, rels, env), env.enums)
-		left => Overload.operator(op_name(a), Infix(arg_of(left, rels, env)), arg_of(a.rexpr, rels, env), env.enums)
+## The argument of an operand list that holds one operand.
+single_arg : List(Typed) -> Overload.Arg
+single_arg = |operands|
+	match operands {
+		[only] => only.arg
+		_ => Unsure
 	}
 
-operator_output : Node.AExpr, List(Check.Output), List(Rel), Env -> Check.Output
-operator_output = |a, operands, rels, env|
-	match operator_choice(a, rels, env) {
-		Ok(choice) => { name: "?column?", type: choice.result, nullable: operator_nullable(choice, operands, env) }
-		Err(_) => { name: "?column?", type: Unknown, nullable: Unknown }
+## The operator the server would pick for `a`.
+operator_choice : Node.AExpr, List(Typed), List(Typed), Env -> Try(Overload.Choice, Overload.Miss)
+operator_choice = |a, lefts, rights, env|
+	match a.lexpr {
+		Null => Overload.operator(op_name(a), Prefix, single_arg(rights), env.enums)
+		_ => Overload.operator(op_name(a), Infix(single_arg(lefts)), single_arg(rights), env.enums)
 	}
 
 ## A strict operator is NULL when an operand is. On numbers, strings,
@@ -1029,37 +1071,10 @@ operator_nullable = |choice, operands, env| {
 	}
 }
 
-## An expression as an argument for picking a function or operator. A
-## string literal, NULL and a parameter have no type yet: the server gives
-## them the type the pick takes there.
-arg_of : Node, List(Rel), Env -> Overload.Arg
-arg_of = |node, rels, env|
-	match node {
-		ParamRef(_) => Untyped
-		AConst(c) =>
-			if c.isnull {
-				Untyped
-			} else {
-				match c.val {
-					String(_) => Untyped
-					other =>
-						match const_type(other) {
-							Known(t) => Known(t)
-							Unknown => Unsure
-						}
-				}
-			}
-		_ =>
-			match expr_output(node, rels, env).type {
-				Known(t) => Known(t)
-				Unknown => Unsure
-			}
-	}
-
-## The function the server would pick for `f`. Named arguments and
-## `variadic` are left to the server.
-function_choice : Node.FuncCall, List(Rel), Env -> Try(Overload.Choice, Overload.Miss)
-function_choice = |f, rels, env| {
+## The function the server would pick for `f`, whose arguments are `args`.
+## Named arguments and `variadic` are left to the server.
+function_choice : Node.FuncCall, List(Typed), Env -> Try(Overload.Choice, Overload.Miss)
+function_choice = |f, args, env| {
 	named =
 		f.args.any(
 			|arg|
@@ -1071,26 +1086,45 @@ function_choice = |f, rels, env| {
 	if named or f.func_variadic {
 		Err(NoChoice)
 	} else {
-		Overload.function(names_of(f.funcname).last() ?? "", f.args.map(|arg| arg_of(arg, rels, env)), env.enums, env.catalog.functions())
+		Overload.function(names_of(f.funcname).last() ?? "", args.map(|a| a.arg), env.enums, env.catalog.functions())
 	}
 }
 
-func_output : Node.FuncCall, List(Rel), Env -> Check.Output
-func_output = |f, rels, env| {
+## A function call, and the function the server would pick for it.
+call : Node.FuncCall, List(Rel), Env -> { typed : Typed, choice : Try(Overload.Choice, Overload.Miss) }
+call = |f, rels, env| {
+	args = f.args.map(|arg| typed(arg, rels, env))
+	rest = f.agg_order.concat([f.agg_filter, f.over]).map(|n| typed(n, rels, env))
+	choice = function_choice(f, args, env)
 	name = names_of(f.funcname).last() ?? "?column?"
-	args = f.args.map(|arg| expr_output(arg, rels, env))
-	match function_choice(f, rels, env) {
-		Ok(choice) => {
-			nullable =
-				match choice.kind {
-					Aggregate => aggregate_nullable(name, args, f, env)
-					Window => window_nullable(name, args)
-					Plain => function_nullable(name, choice, args)
-				}
-			{ name, type: choice.result, nullable }
+	outputs = args.map(|a| a.output)
+	output =
+		match choice {
+			Ok(c) => {
+				nullable =
+					match c.kind {
+						Aggregate => aggregate_nullable(name, outputs, f, env)
+						Window => window_nullable(name, outputs)
+						Plain => function_nullable(name, c, outputs)
+					}
+				{ name, type: c.result, nullable }
+			}
+			Err(_) => { name, type: Unknown, nullable: Unknown }
 		}
-		Err(_) => { name, type: Unknown, nullable: Unknown }
-	}
+	value = over(output, args.concat(rest))
+	aggregate_call =
+		match choice {
+			Ok({ kind: Aggregate, .. }) => f.over == Null
+			_ => Bool.False
+		}
+	ungrouped =
+		match choice {
+			# A function this does not know could be an aggregate.
+			Err(_) => []
+			Ok(_) => if aggregate_call [] else value.ungrouped
+		}
+	problems = function_call_problems(f, args, choice, env).concat(function_param_problems(f, choice, env)).concat(value.problems)
+	{ typed: { ..value, problems, aggregate: aggregate_call or value.aggregate, ungrouped }, choice }
 }
 
 ## Functions that return NULL only for a NULL argument.
@@ -1151,30 +1185,34 @@ window_nullable = |name, args|
 		_ => Unknown
 	}
 
-sublink_output : Node.SubLink, List(Rel), Env -> Check.Output
-sublink_output = |s, rels, env| {
-	first = || {
-		match statement(s.subselect, { ..env, outer: rels.concat(env.outer) }).outputs {
+## A subquery in an expression, read once for its value and its problems.
+sublink : Node.SubLink, List(Rel), Env -> Typed
+sublink = |s, rels, env| {
+	test = typed(s.testexpr, rels, env)
+	result = statement(s.subselect, { ..env, outer: rels.concat(env.outer) })
+	first =
+		match result.outputs {
 			Known([output, ..]) => output
-			_ => { name: "?column?", type: Unknown, nullable: Unknown }
+			_ => unknown_output
 		}
-	}
-	if s.sub_link_type == Enums.exists_sublink {
-		{ name: "exists", type: Known("boolean"), nullable: No }
-	} else if s.sub_link_type == Enums.expr_sublink {
-		# A scalar subquery is NULL when it finds no row.
-		{ ..first(), nullable: Yes }
-	} else if s.sub_link_type == Enums.array_sublink {
-		element = first()
-		type =
-			match element.type {
-				Known(t) => Known("${t}[]")
-				Unknown => Unknown
-			}
-		{ name: "array", type, nullable: No }
-	} else {
-		{ name: "?column?", type: Known("boolean"), nullable: Unknown }
-	}
+	output =
+		if s.sub_link_type == Enums.exists_sublink {
+			{ name: "exists", type: Known("boolean"), nullable: No }
+		} else if s.sub_link_type == Enums.expr_sublink {
+			# A scalar subquery is NULL when it finds no row.
+			{ ..first, nullable: Yes }
+		} else if s.sub_link_type == Enums.array_sublink {
+			type =
+				match first.type {
+					Known(t) => Known("${t}[]")
+					Unknown => Unknown
+				}
+			{ name: "array", type, nullable: No }
+		} else {
+			{ name: "?column?", type: Known("boolean"), nullable: Unknown }
+		}
+	# What the subquery reads is grouped or not in its own select.
+	{ ..over(output, [test]), problems: test.problems.concat(result.problems), ungrouped: test.ungrouped }
 }
 
 sql_value_output : Node.SQLValueFunction -> Check.Output
@@ -1300,54 +1338,6 @@ missing_column = |rel, name|
 		_ => Err(Exists)
 	}
 
-## Problems in an expression: column references that do not exist,
-## parameters that do not fit the column they are compared with, and
-## whatever a subquery inside it finds.
-expression_problems : Node, List(Rel), Env -> List(Str)
-expression_problems = |node, rels, env| {
-	one = |child| expression_problems(child, rels, env)
-	all = |children| children.fold([], |acc, child| acc.concat(expression_problems(child, rels, env)))
-	match node {
-		ColumnRef(c) =>
-			match column_ref(c) {
-				Ok(ref) =>
-					match resolve(ref, rels, env) {
-						Missing(problem) => [problem]
-						_ => []
-					}
-				Err(_) => []
-			}
-		AExpr(a) => operator_call_problems(a, rels, env).concat(comparison_problems(a, rels, env)).concat(operator_param_problems(a, rels, env)).concat(one(a.lexpr)).concat(one(a.rexpr))
-		BoolExpr(b) => all(b.args)
-		NodeList(items) => all(items)
-		FuncCall(f) => function_call_problems(f, rels, env).concat(function_param_problems(f, rels, env)).concat(all(f.args)).concat(all(f.agg_order)).concat(one(f.agg_filter)).concat(one(f.over))
-		NamedArgExpr(n) => one(n.arg)
-		TypeCast(t) => cast_param_problems(t, env).concat(one(t.arg))
-		CollateClause(c) => one(c.arg)
-		NullTest(t) => one(t.arg)
-		BooleanTest(t) => one(t.arg)
-		CoalesceExpr(c) => all(c.args)
-		MinMaxExpr(m) => all(m.args)
-		CaseExpr(c) => one(c.arg).concat(all(c.args)).concat(one(c.defresult))
-		CaseWhen(w) => one(w.expr).concat(one(w.result))
-		AArrayExpr(a) => all(a.elements)
-		RowExpr(r) => all(r.args)
-		AIndirection(i) => one(i.arg).concat(all(i.indirection))
-		AIndices(i) => one(i.lidx).concat(one(i.uidx))
-		SortBy(s) => one(s.node)
-		WindowDef(w) => all(w.partition_clause).concat(all(w.order_clause)).concat(one(w.start_offset)).concat(one(w.end_offset))
-		GroupingFunc(g) => all(g.args)
-		GroupingSet(g) => all(g.content)
-		ResTarget(t) => one(t.val)
-		MultiAssignRef(m) => one(m.source)
-		SubLink(s) => one(s.testexpr).concat(statement(s.subselect, { ..env, outer: rels.concat(env.outer) }).problems)
-		_ => []
-	}
-}
-
-## Problems of parameters compared with a column: `col = $name`,
-## `$name <> col`, `col in ($a, $b)`, `col between $a and $b` and
-## `col = any($names)`.
 ## Whether a call no function or operator takes is refused. Only with a
 ## schema that creates no extension: an extension brings functions,
 ## operators and casts this does not know, and without a schema the
@@ -1367,35 +1357,35 @@ arg_text = |arg|
 
 ## A call of a function that does not exist, or that no function of its
 ## name takes.
-function_call_problems : Node.FuncCall, List(Rel), Env -> List(Str)
-function_call_problems = |f, rels, env|
+function_call_problems : Node.FuncCall, List(Typed), Try(Overload.Choice, Overload.Miss), Env -> List(Str)
+function_call_problems = |f, args, choice, env|
 	if !refuses_calls(env) {
 		[]
 	} else {
 		name = names_of(f.funcname).last() ?? ""
-		match function_choice(f, rels, env) {
+		match choice {
 			Err(NoSuchName) => ["function `${name}` does not exist"]
-			Err(NoMatch) => ["function `${name}(${Str.join_with(f.args.map(|arg| arg_text(arg_of(arg, rels, env))), ", ")})` does not exist"]
+			Err(NoMatch) => ["function `${name}(${Str.join_with(args.map(|arg| arg_text(arg.arg)), ", ")})` does not exist"]
 			_ => []
 		}
 	}
 
 ## An operator between types no operator of its name takes, as in
 ## `text_col = int_col`.
-operator_call_problems : Node.AExpr, List(Rel), Env -> List(Str)
-operator_call_problems = |a, rels, env|
+operator_call_problems : Node.AExpr, List(Typed), List(Typed), Try(Overload.Choice, Overload.Miss), Env -> List(Str)
+operator_call_problems = |a, lefts, rights, choice, env|
 	if !refuses_calls(env) or a.kind != Enums.aexpr_op {
 		[]
 	} else {
-		match operator_choice(a, rels, env) {
+		match choice {
 			Err(NoMatch) | Err(NoSuchName) => {
-				right = arg_text(arg_of(a.rexpr, rels, env))
-				call =
+				right = arg_text(single_arg(rights))
+				written =
 					match a.lexpr {
 						Null => "${op_name(a)} ${right}"
-						left => "${arg_text(arg_of(left, rels, env))} ${op_name(a)} ${right}"
+						_ => "${arg_text(single_arg(lefts))} ${op_name(a)} ${right}"
 					}
-				["operator `${call}` does not exist"]
+				["operator `${written}` does not exist"]
 			}
 			_ => []
 		}
@@ -1416,26 +1406,23 @@ param_type_problems = |p, type, what, env|
 
 ## Problems of parameters that are operands of an operator other than a
 ## comparison with a column, which [comparison_problems] reads.
-operator_param_problems : Node.AExpr, List(Rel), Env -> List(Str)
-operator_param_problems = |a, rels, env|
+operator_param_problems : Node.AExpr, List(Typed), List(Typed), Try(Overload.Choice, Overload.Miss), Env -> List(Str)
+operator_param_problems = |a, lefts, rights, choice, env|
 	if env.params.is_empty() or a.kind != Enums.aexpr_op {
 		[]
 	} else if comparison_ops.contains(op_name(a)) {
 		# A parameter compared with an expression of a known type.
 		match (a.lexpr, a.rexpr) {
 			(ParamRef(_), ColumnRef(_)) | (ColumnRef(_), ParamRef(_)) => []
-			(ParamRef(p), other) | (other, ParamRef(p)) =>
-				match expr_output(other, rels, env).type {
-					Known(type) => param_type_problems(p, type, "`${op_name(a)}`", env)
-					Unknown => []
-				}
+			(ParamRef(p), _) => compared_param_problems(p, rights, a, env)
+			(_, ParamRef(p)) => compared_param_problems(p, lefts, a, env)
 			_ => []
 		}
 	} else {
-		match operator_choice(a, rels, env) {
-			Ok(choice) => {
+		match choice {
+			Ok(c) => {
 				operands = if a.lexpr == Null [a.rexpr] else [a.lexpr, a.rexpr]
-				List.map2(operands, choice.params, |operand, type| (operand, type)).fold(
+				List.map2(operands, c.params, |operand, type| (operand, type)).fold(
 					[],
 					|acc, (operand, type)|
 						match operand {
@@ -1448,19 +1435,31 @@ operator_param_problems = |a, rels, env|
 		}
 	}
 
+## A parameter compared with an expression of a known type takes it.
+compared_param_problems : Node.ParamRef, List(Typed), Node.AExpr, Env -> List(Str)
+compared_param_problems = |p, others, a, env|
+	match others {
+		[other] =>
+			match other.output.type {
+				Known(type) => param_type_problems(p, type, "`${op_name(a)}`", env)
+				Unknown => []
+			}
+		_ => []
+	}
+
 ## Problems of parameters passed to a function.
-function_param_problems : Node.FuncCall, List(Rel), Env -> List(Str)
-function_param_problems = |f, rels, env|
+function_param_problems : Node.FuncCall, Try(Overload.Choice, Overload.Miss), Env -> List(Str)
+function_param_problems = |f, choice, env|
 	if env.params.is_empty() {
 		[]
 	} else {
-		match function_choice(f, rels, env) {
-			Ok(choice) =>
-				List.map2(f.args, choice.params, |arg, type| (arg, type)).fold(
+		match choice {
+			Ok(c) =>
+				List.map2(f.args, c.params, |arg, type| (arg, type)).fold(
 					[],
 					|acc, (arg, type)|
 						match arg {
-							ParamRef(p) => acc.concat(param_type_problems(p, type, "`${choice.name}`", env))
+							ParamRef(p) => acc.concat(param_type_problems(p, type, "`${c.name}`", env))
 							_ => acc
 						},
 				)
@@ -1603,7 +1602,10 @@ target_rel = |node, env|
 returning_list : Node, List(Rel), Env -> Check.Result
 returning_list = |node, rels, env|
 	match node {
-		ReturningClause(r) => target_list(r.exprs, rels, env)
+		ReturningClause(r) => {
+			{ outputs, problems, .. } = target_list(r.exprs, rels, env)
+			{ outputs, problems }
+		}
 		_ => { outputs: Known([]), problems: [] }
 	}
 
@@ -1632,24 +1634,26 @@ set_problems = |items, target, rels, env| {
 				_ => acc
 			},
 	)
-	stored = assignments.fold(
+	values = assignments.map(|t| (t, typed(t.val, rels, env)))
+	stored = values.fold(
 		[],
-		|acc, t|
+		|acc, (t, value)|
 			match (t.indirection, column_in(target, t.name ?? "")) {
-				([], Found(column)) => acc.concat(value_problems(t.val, t.name ?? "", column, rels, env))
+				([], Found(column)) => acc.concat(value_problems(t.val, value.output, t.name ?? "", column, env))
 				_ => acc
 			},
 	)
-	values = assignments.fold([], |acc, t| acc.concat(expression_problems(t.val, rels, env)))
-	missing.concat(params).concat(stored).concat(values)
+	inside = values.fold([], |acc, (_, value)| acc.concat(value.problems))
+	missing.concat(params).concat(stored).concat(inside)
 }
 
 ## Problems of `value` stored in `column`: a type the column cannot take
 ## on assignment, or NULL where it takes none. Parameters are checked by
-## [param_problems], and a string literal is parsed by the server.
-value_problems : Node, Str, Check.Output, List(Rel), Env -> List(Str)
-value_problems = |value, column_name, column, rels, env| {
-	typed = |output|
+## [param_problems], and a string literal is parsed by the server. `output`
+## is what the walk found of `value`.
+value_problems : Node, Check.Output, Str, Check.Output, Env -> List(Str)
+value_problems = |value, output, column_name, column, env| {
+	fits =
 		match (output.type, column.type) {
 			(Known(from), Known(to)) if !Overload.can_assign(from, to, env.enums) => ["column `${column_name}` is `${to}`, but the value is `${from}`"]
 			_ => []
@@ -1663,41 +1667,55 @@ value_problems = |value, column_name, column, rels, env| {
 			} else {
 				match c.val {
 					String(_) => []
-					_ => typed(expr_output(value, rels, env))
+					_ => fits
 				}
 			}
-		_ => typed(expr_output(value, rels, env))
+		_ => fits
 	}
 }
+
+## What an insert stores: `values` rows, each value with what the walk
+## found of it, `default values`, or the result of a query.
+InsertSource : [Values(List(List((Node, Typed)))), DefaultValues, Query(Check.Result)]
+
+insert_source : Node, Env -> InsertSource
+insert_source = |source, env|
+	match source {
+		SelectStmt(sel) if sel.op == Enums.setop_none and !sel.values_lists.is_empty() =>
+			Values(
+				sel.values_lists.map(
+					|row|
+						match row {
+							NodeList(items) => items.map(|item| (item, typed(item, [], env)))
+							_ => []
+						},
+				),
+			)
+		Null => DefaultValues
+		query => Query(statement(query, env))
+	}
 
 ## Problems of the shape of what an insert stores: as many values as it
 ## names columns, values that fit their columns, and every column that is
 ## `NOT NULL` without a default given one. A table with a trigger may fill
 ## in a column itself, so it is not held to the last rule.
-insert_shape_problems : Node, List(Str), Rel, Env -> List(Str)
+insert_shape_problems : InsertSource, List(Str), Rel, Env -> List(Str)
 insert_shape_problems = |source, listed, target, env| {
 	table_columns_list = known_list(target.columns)
 	columns = if listed.is_empty() table_columns_list.map(|c| c.name) else listed
 	{ widths, value_problems: stored } =
 		match source {
-			SelectStmt(sel) if sel.op == Enums.setop_none and !sel.values_lists.is_empty() => {
-				rows = sel.values_lists.map(
-					|row|
-						match row {
-							NodeList(items) => items
-							_ => []
-						},
-				)
+			Values(rows) => {
 				stored_problems = rows.fold(
 					[],
 					|acc, items|
 						items.map_with_index(|item, i| (item, i)).fold(
 							acc,
-							|inner, (item, i)|
+							|inner, ((item, value), i)|
 								match columns.get(i) {
 									Ok(col) =>
 										match column_in(target, col) {
-											Found(column) => inner.concat(value_problems(item, col, column, [], env))
+											Found(column) => inner.concat(value_problems(item, value.output, col, column, env))
 											_ => inner
 										}
 									Err(_) => inner
@@ -1706,9 +1724,9 @@ insert_shape_problems = |source, listed, target, env| {
 				)
 				{ widths: rows.map(|items| items.len()), value_problems: stored_problems }
 			}
-			Null => { widths: [0], value_problems: [] }
-			query =>
-				match statement(query, env).outputs {
+			DefaultValues => { widths: [0], value_problems: [] }
+			Query(result) =>
+				match result.outputs {
 					Known(outputs) => {
 						stored_problems = outputs.map_with_index(|o, i| (o, i)).fold(
 							[],
@@ -1799,9 +1817,10 @@ merge_insert_problems = |w, target, source, env| {
 		} else {
 			[]
 		}
-	stored = w.values.map_with_index(|value, i| (value, i)).fold(
+	walked = w.values.map(|value| (value, typed(value, source, env)))
+	stored = walked.map_with_index(|pair, i| (pair, i)).fold(
 		[],
-		|acc, (value, i)|
+		|acc, ((value, found), i)|
 			match columns.get(i).map_ok(|col| (col, column_in(target, col))) {
 				Ok((col, Found(column))) => {
 					params =
@@ -1813,13 +1832,13 @@ merge_insert_problems = |w, target, source, env| {
 								}
 							_ => []
 						}
-					acc.concat(params).concat(value_problems(value, col, column, source, env))
+					acc.concat(params).concat(value_problems(value, found.output, col, column, env))
 				}
 				_ => acc
 			},
 	)
-	values = w.values.fold([], |acc, value| acc.concat(expression_problems(value, source, env)))
-	missing.concat(count).concat(stored).concat(values)
+	inside = walked.fold([], |acc, (_, found)| acc.concat(found.problems))
+	missing.concat(count).concat(stored).concat(inside)
 }
 
 insert_stmt : Node.InsertStmt, Env -> Check.Result
@@ -1834,13 +1853,13 @@ insert_stmt = |s, env| {
 			},
 	)
 	column_problems = listed.keep_oks(|c| missing_column({ ..target, alias: target.table }, c))
-	shape_problems = insert_shape_problems(s.select_stmt, listed, target, inner)
+	source = insert_source(s.select_stmt, inner)
+	shape_problems = insert_shape_problems(source, listed, target, inner)
 	source_problems =
-		match s.select_stmt {
-			SelectStmt(sel) if sel.op == Enums.setop_none and !sel.values_lists.is_empty() =>
-				values_problems(sel.values_lists, listed, target, inner).concat(values_select(sel.values_lists, inner).problems)
-			Null => []
-			other => statement(other, inner).problems
+		match source {
+			Values(rows) => values_problems(rows, listed, target, inner).concat(rows.fold([], |acc, row| row.fold(acc, |inner_acc, (_, value)| inner_acc.concat(value.problems))))
+			DefaultValues => []
+			Query(result) => result.problems
 		}
 	excluded = { ..target, alias: "excluded" }
 	conflict_problems =
@@ -1854,28 +1873,24 @@ insert_stmt = |s, env| {
 
 ## Problems of the parameters in `values ($a, $b), ...` of an insert into
 ## `target`, whose listed columns are `listed` (all of them when empty).
-values_problems : List(Node), List(Str), Rel, Env -> List(Str)
-values_problems = |lists, listed, target, env| {
+values_problems : List(List((Node, Typed))), List(Str), Rel, Env -> List(Str)
+values_problems = |rows, listed, target, env| {
 	columns = if listed.is_empty() known_list(target.columns).map(|c| c.name) else listed
-	lists.fold(
+	rows.fold(
 		[],
-		|acc, row|
-			match row {
-				NodeList(items) =>
-					items.map_with_index(|item, index| (item, index)).fold(
-						acc,
-						|inner, (item, index)|
-							match (item, columns.get(index)) {
-								(ParamRef(p), Ok(col)) =>
-									match (param_name(p, env), column_in(target, col)) {
-										(Ok(name), Found(column)) => inner.concat(param_problems(name, col, column, Bool.True, env))
-										_ => inner
-									}
+		|acc, items|
+			items.map_with_index(|(item, _), index| (item, index)).fold(
+				acc,
+				|inner, (item, index)|
+					match (item, columns.get(index)) {
+						(ParamRef(p), Ok(col)) =>
+							match (param_name(p, env), column_in(target, col)) {
+								(Ok(name), Found(column)) => inner.concat(param_problems(name, col, column, Bool.True, env))
 								_ => inner
-							},
-					)
-				_ => acc
-			},
+							}
+						_ => inner
+					},
+			),
 	)
 }
 
@@ -2105,3 +2120,6 @@ expect problems("merge into schools o using students r on o.id = r.schol_id when
 expect problems("merge into schools o using students r on o.id = r.school_id when not matched then insert (id, name) values (true, r.name)") == ["column `id` is `integer`, but the value is `boolean`"]
 expect problems("merge into schools o using students r on o.id = r.school_id when not matched then insert (id, name) values (r.school_id)") == ["the insert names 2 columns but gives 1 values"]
 expect outputs("merge into schools o using students r on o.id = r.school_id when matched then delete returning o.id, r.phone") == ["id integer", "phone text null"]
+
+# Each node is read once, so a long expression costs no more than its length.
+expect outputs("select ${Str.join_with(List.repeat("id", 20), " + ")} as x, coalesce(${Str.join_with(List.repeat("phone", 20), " || ")}, '') as y from students") == ["x integer", "y text"]
