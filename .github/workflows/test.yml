@@ -23,6 +23,10 @@ jobs:
     uses: niclas-ahden/roc-workflows/.github/workflows/test.yml@v3
     with:
       examples: ''
+      # WORKAROUND: the expect blocks build at dev, since an optimized build
+      # of the parser needs more memory than the runner has. Back to speed
+      # once compiler optimizations reduce its memory footprint.
+      test-opt: dev
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
