@@ -837,9 +837,16 @@ read_message! = |client| {
 			[]
 		}
 
-	match ProtoBackend.message(msg_type, payload) {
-		Ok(message) => Ok(message)
-		Err(err) => Err(PgProtoErr(err))
+	# A NotificationResponse, for a channel this session LISTENs on, can
+	# arrive between any two messages. roc-pg delivers no notifications, so
+	# it reads past them.
+	if msg_type == 'A' {
+		read_message!(client)
+	} else {
+		match ProtoBackend.message(msg_type, payload) {
+			Ok(message) => Ok(message)
+			Err(err) => Err(PgProtoErr(err))
+		}
 	}
 }
 

@@ -134,6 +134,10 @@ For comparison, the real app rebellion is modeled on builds in about 7 seconds o
 
 That is about 0.4 seconds for each field of each distinct row type, whether or not there is a schema. The same 20 queries check in about 26 seconds either way. `small` shows the same at a realistic mix of column types: 130 seconds with a row type for each query, 46 seconds when they all share one. rebellion has 212 distinct row types, many of them wide, which is most likely why its build takes more than 30 minutes.
 
+## Not supported
+
+- `LISTEN` and `NOTIFY`. A session can run them, but the client never delivers a notification. It reads past any that arrive.
+
 ## Structure
 
 - `Scan.roc` (a port of Postgres's lexer) and `Parse.roc` (Postgres's parser loop, driven by the tables in `Grammar.roc`) parse the SQL. `Actions.roc` builds the parse tree out of `Node.roc`'s types, one function per rule of `gram.y`.

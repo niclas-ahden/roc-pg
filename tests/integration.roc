@@ -74,6 +74,7 @@ main! = |args| {
 	test_prepared_elsewhere!(server, client)?
 	test_param_not_allowed!(server)?
 	test_startup_last_value_wins!(server)?
+	test_notifications_skipped!(client)?
 	client.close!()
 
 	Stdout.line!("all integration tests passed")?
@@ -992,4 +993,17 @@ read_startup_replies! = |stream, reported| {
 		# AuthOk (the test server trusts this user), BackendKeyData and notices.
 		_ => read_startup_replies!(stream, reported)
 	}
+}
+
+## A notification for a channel the session listens on arrives as soon as
+## the notifying transaction commits, in the middle of a reply. The client
+## reads past it, for extended and simple queries alike.
+test_notifications_skipped! = |client| {
+	_ = client.execute_unchecked!("listen roc_pg_test", [])?
+	_ = client.execute_unchecked!("notify roc_pg_test, 'extended'", [])?
+	client.batch_execute_unchecked!("notify roc_pg_test, 'simple'; select 1")?
+	n = client.query_one_unchecked!("select 2 as n", [], |r| r.i32("n"))?
+	check("a query after notifications", n == 2)?
+	_ = client.execute_unchecked!("unlisten roc_pg_test", [])?
+	Stdout.line!("ok: notifications skipped")
 }
