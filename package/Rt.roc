@@ -202,19 +202,19 @@ Rt :: [].{
 	int_str : I64 -> Str
 	int_str = |n| n.to_str()
 
-	## ---- bits, on the non-negative values flags use ----
+	## ---- bits, as C computes them on a two's complement int ----
 
 	bit_or : I64, I64 -> I64
-	bit_or = |x, y| bits(x, y, Or)
+	bit_or = |x, y| x.bitwise_or(y)
 
 	bit_and : I64, I64 -> I64
-	bit_and = |x, y| bits(x, y, And)
+	bit_and = |x, y| x.bitwise_and(y)
 
 	bit_not : I64 -> I64
-	bit_not = |x| -1 - x
+	bit_not = |x| x.bitwise_not()
 
 	shift_left : I64, I64 -> I64
-	shift_left = |x, n| if n <= 0 x else Rt.shift_left(x * 2, n - 1)
+	shift_left = |x, n| x.shl_wrap(n.to_u8_wrap())
 
 	## ---- nodes ----
 
@@ -263,27 +263,3 @@ compare_bytes = |a, b| {
 
 ascii_lower : U8 -> U8
 ascii_lower = |c| if c >= 'A' and c <= 'Z' c + 32 else c
-
-bits : I64, I64, [Or, And] -> I64
-bits = |x, y, op| {
-	var $a = x
-	var $b = y
-	var $bit = 1.I64
-	var $out = 0.I64
-	while $a > 0 or $b > 0 {
-		abit = $a % 2
-		bbit = $b % 2
-		on =
-			match op {
-				Or => abit == 1 or bbit == 1
-				And => abit == 1 and bbit == 1
-			}
-		if on {
-			$out = $out + $bit
-		}
-		$a = $a // 2
-		$b = $b // 2
-		$bit = $bit * 2
-	}
-	$out
-}

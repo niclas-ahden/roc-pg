@@ -502,6 +502,16 @@ expect Parse.check("select 1 2 'oops").map_err(|p| p.message) == Err("syntax err
 expect Parse.check("select (").map_err(|p| p.message) == Err("syntax error at end of input")
 expect Parse.check("select U&'d\\0061t' UESCAPE '\\'") == Ok({})
 
+# Flag sets are combined with C's bit operators: EXCLUDING clears its bit
+# from ALL, and an interval mask with DAY in it is refused.
+expect {
+	like = |sql| Parse.parse(sql).map_ok(|stmts| stmts.first().map_ok(|s| Node.create_stmt_of(Node.raw_stmt_of(s).stmt).table_elts.first().map_ok(|e| Node.table_like_clause_of(e).options)))
+	like("create table t (like s including all excluding indexes)") == Ok(Ok(Ok(2147483647 - 64)))
+}
+expect Parse.check("set time zone interval '1' hour") == Ok({})
+expect Parse.check("set time zone interval '1' hour to minute") == Ok({})
+expect Parse.check("set time zone interval '1' day").map_err(|p| p.message) == Err("time zone interval must be HOUR or HOUR TO MINUTE")
+
 ## "invalid Unicode surrogate pair" at offset `i` of a `U&` value.
 invalid_pair : List(U8), U64, U64 -> Scan.Problem
 invalid_pair = |source, i, position| { message: "invalid Unicode surrogate pair", code: "42601", cursor: Scan.cursor_at(source, i + position + 3) }
