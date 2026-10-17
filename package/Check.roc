@@ -184,8 +184,8 @@ Typed : { output : Check.Output, arg : Overload.Arg, problems : List(Str), aggre
 ## does not see, because a `using` or `natural` join merged them into the
 ## same column of the other side.
 ## `not_null` are the columns a `where` clause keeps only rows where they
-## are not NULL.
-Rel : { alias : Str, table : Str, columns : Cols, nullable : Bool, hidden : List(Str), not_null : List(Str) }
+## are not NULL. `source` is the catalog's table for a table or view.
+Rel : { alias : Str, table : Str, columns : Cols, nullable : Bool, hidden : List(Str), not_null : List(Str), source : Try(Catalog.Table, [NotATable]) }
 
 Lookup : [Found(Check.Output), Missing(Str), Unsure]
 
@@ -414,7 +414,7 @@ simple_select : Node.SelectStmt, Env -> Check.Result
 simple_select = |s, outer_env| {
 	plain = { ..outer_env, grouped: Bool.False, group: NoGroup }
 	{ rels, problems: from_problems } = from_list(s.from_clause, plain)
-	grouping = group_of(s, rels, plain)
+	grouping = group_of(s, rels)
 	# An empty grouping set, like the one `rollup` adds, makes a row of all
 	# the rows: when there are none, its aggregates see none.
 	clause_env = { ..plain, grouped: !s.group_clause.is_empty() and !grouping.empty }
@@ -467,8 +467,8 @@ owner = |ref, rels|
 
 ## What a select groups by, for reading its select list, `having` and
 ## `order by`, and whether one of its grouping sets is empty.
-group_of : Node.SelectStmt, List(Rel), Env -> { group : Group, empty : Bool }
-group_of = |s, rels, env| {
+group_of : Node.SelectStmt, List(Rel) -> { group : Group, empty : Bool }
+group_of = |s, rels| {
 	selected = s.target_list.keep_oks(
 		|t|
 			match t {
@@ -511,7 +511,7 @@ group_of = |s, rels, env| {
 	common_keys = keys_of(every)
 	covered = rels.keep_if(
 		|r|
-			match env.catalog.table(r.table) {
+			match r.source {
 				Ok(table) if !table.primary_key.is_empty() and r.columns != Unknown => table.primary_key.all(|col| common_keys.contains((r.alias, col)))
 				_ => Bool.False
 			},
@@ -591,9 +591,8 @@ from_item : Node, Env -> { rels : List(Rel), problems : List(Str) }
 from_item = |node, env|
 	match node {
 		RangeVar(r) => {
-			name = r.relname ?? ""
-			{ columns, problems } = table_columns(name, env, is_set(r.schemaname))
-			{ rels: [aliased(name, columns, r.alias)], problems }
+			found = table_columns(r, env)
+			{ rels: [{ ..aliased(r.relname ?? "", found.columns, r.alias), source: found.source }], problems: found.problems }
 		}
 		RangeSubselect(r) => {
 			result = statement(r.subquery, env)
@@ -639,7 +638,7 @@ from_item = |node, env|
 		JoinExpr(j) => join(j, env)
 		# A relation this does not read still has a name, and columns that
 		# are not known.
-		_ => { rels: [{ alias: "?", table: "?", columns: Unknown, nullable: Bool.False, hidden: [], not_null: [] }], problems: [] }
+		_ => { rels: [aliased("?", Unknown, Null)], problems: [] }
 	}
 
 ## A function in `from`, or several in `rows from (...)`. A function that
@@ -686,6 +685,8 @@ range_function = |r, env| {
 				} else {
 					match found.choice {
 						Ok({ outputs: [_, ..] as outputs, .. }) => Known(outputs.map(|o| { name: o.name, type: Known(o.type), nullable: Unknown }))
+						# A function that returns a table's row type, as `returns setof t`.
+						Ok({ result: Known(type), .. }) if row_type_columns(type, env) != Unknown => row_type_columns(type, env)
 						Ok({ result: Known(type), .. }) if Overload.category(type, env.enums) != 'C' => {
 							column =
 								match r.alias {
@@ -710,6 +711,14 @@ range_function = |r, env| {
 		}
 	{ rels: [aliased(name, columns, r.alias)], problems }
 }
+
+## The columns of the table or view whose row type `type` is.
+row_type_columns : Str, Env -> Cols
+row_type_columns = |type, env|
+	match env.catalog.table(type) {
+		Ok({ columns: Known(columns), .. }) => Known(columns.map(|c| { name: c.name, type: Known(c.type), nullable: Unknown }))
+		_ => Unknown
+	}
 
 ## The columns of `json_table(... columns (...))`, those of nested paths
 ## among them. A value the path does not find is NULL.
@@ -736,8 +745,8 @@ json_table_columns = |columns|
 aliased : Str, Cols, Node -> Rel
 aliased = |table, columns, alias|
 	match alias {
-		Alias(a) => { alias: a.aliasname ?? table, table, columns: rename(columns, names_of(a.colnames)), nullable: Bool.False, hidden: [], not_null: [] }
-		_ => { alias: table, table, columns, nullable: Bool.False, hidden: [], not_null: [] }
+		Alias(a) => { alias: a.aliasname ?? table, table, columns: rename(columns, names_of(a.colnames)), nullable: Bool.False, hidden: [], not_null: [], source: Err(NotATable) }
+		_ => { alias: table, table, columns, nullable: Bool.False, hidden: [], not_null: [], source: Err(NotATable) }
 	}
 
 ## Both sides of a join, marked NULL where an outer join can make them so.
@@ -770,35 +779,69 @@ join = |j, env| {
 	{ rels, problems }
 }
 
-## A table's columns from the query's CTEs or the catalog. An unknown name is
-## a problem only when the catalog has tables to compare with.
-table_columns : Str, Env, Bool -> { columns : Cols, problems : List(Str) }
-table_columns = |name, env, qualified| {
-	cte = if qualified Err(NotFound) else env.ctes.find_first(|c| c.name == name)
+## A table's columns from the query's CTEs or the catalog, and the
+## catalog's table. A name with a schema is that schema's table, one
+## without is a CTE or the table of the first schema on the search path
+## that has one, as `RangeVarGetRelid` finds it. An unknown name is a
+## problem only when the catalog has tables to compare with.
+table_columns : Node.RangeVar, Env -> { columns : Cols, source : Try(Catalog.Table, [NotATable]), problems : List(Str) }
+table_columns = |r, env| {
+	name = r.relname ?? ""
+	schema =
+		match r.schemaname {
+			Ok(s) => Qualified(s)
+			Err(_) => Unqualified
+		}
+	cte = if schema == Unqualified env.ctes.find_first(|c| c.name == name) else Err(NotFound)
 	match cte {
-		Ok(found) => { columns: found.columns, problems: [] }
+		Ok(found) => { columns: found.columns, source: Err(NotATable), problems: [] }
 		Err(_) =>
-			match env.catalog.table(name) {
-				Ok(table) =>
-					match table.columns {
-						Known(columns) => { columns: Known(columns.map(|c| { name: c.name, type: Known(c.type), nullable: if c.not_null No else Yes })), problems: [] }
-						View(view) => {
-							# A view's columns are what its query returns. Problems inside it
-							# are not this query's.
-							result = statement(view.query, { ..env, ctes: [], outer: [], params: [], grouped: Bool.False })
-							{ columns: rename(result.outputs, view.aliases), problems: [] }
+			match env.catalog.find_table(schema, name) {
+				Ok(table) => {
+					columns =
+						match table.columns {
+							Known(defined) => Known(defined.map(|c| { name: c.name, type: Known(c.type), nullable: if c.not_null No else Yes }))
+							View(view) => {
+								# A view's columns are what its query returns. Problems inside it
+								# are not this query's.
+								result = statement(view.query, { ..env, ctes: [], outer: [], params: [], grouped: Bool.False })
+								rename(result.outputs, view.aliases)
+							}
+							Unknown => Unknown
 						}
-						Unknown => { columns: Unknown, problems: [] }
-					}
+					{ columns, source: Ok(table), problems: [] }
+				}
 				Err(_) =>
 					if env.catalog.is_none() {
-						{ columns: Unknown, problems: [] }
+						{ columns: Unknown, source: Err(NotATable), problems: [] }
 					} else {
-						{ columns: Unknown, problems: ["table `${name}` does not exist in the schema${Check.suggestion(name, env.catalog.tables().map(|t| t.name).concat(env.ctes.map(|c| c.name)))}"] }
+						{ columns: Unknown, source: Err(NotATable), problems: [missing_table(schema, name, env)] }
 					}
 			}
 	}
 }
+
+## "table `x` does not exist in the schema", with the closest name of a
+## table it could have meant.
+missing_table : [Qualified(Str), Unqualified], Str, Env -> Str
+missing_table = |schema, name, env|
+	match schema {
+		Qualified(s) => {
+			names = env.catalog.tables().keep_if(|t| t.schema == s).map(|t| t.name)
+			"table `${s}.${name}` does not exist in the schema${Check.suggestion(name, names)}"
+		}
+		Unqualified => {
+			path = env.catalog.search_path()
+			names = env.catalog.tables().keep_if(|t| path.contains(t.schema)).map(|t| t.name).concat(env.ctes.map(|c| c.name))
+			elsewhere = env.catalog.tables().keep_if(|t| t.name == name).map(|t| "${t.schema}.${t.name}")
+			hint =
+				match elsewhere {
+					[first, ..] => " (did you mean `${first}`? Its schema is not on the search path)"
+					[] => Check.suggestion(name, names)
+				}
+			"table `${name}` does not exist in the schema${hint}"
+		}
+	}
 
 ## The outputs of a select or `returning` list, with what its items found.
 Targets : { outputs : Cols, problems : List(Str), aggregate : Bool, ungrouped : List(Str) }
@@ -1302,7 +1345,15 @@ function_choice = |f, args, env| {
 	if named or f.func_variadic {
 		Err(NoChoice)
 	} else {
-		Overload.function(names_of(f.funcname).last() ?? "", args.map(|a| a.arg), env.enums, env.catalog.functions())
+		# A call that names a schema reaches only its functions, one that does
+		# not those of the search path, after the built in ones.
+		schema =
+			match names_of(f.funcname) {
+				[.., s, _] => Qualified(s)
+				_ => Unqualified
+			}
+		builtins = schema == Unqualified or schema == Qualified("pg_catalog")
+		Overload.function_from(names_of(f.funcname).last() ?? "", args.map(|a| a.arg), env.enums, builtins, env.catalog.functions_in(schema))
 	}
 }
 
@@ -1826,11 +1877,10 @@ target_rel : Node, Env -> { rel : Rel, problems : List(Str) }
 target_rel = |node, env|
 	match node {
 		RangeVar(r) => {
-			name = r.relname ?? ""
-			{ columns, problems } = table_columns(name, { ..env, ctes: [] }, is_set(r.schemaname))
-			{ rel: aliased(name, columns, r.alias), problems }
+			found = table_columns(r, { ..env, ctes: [] })
+			{ rel: { ..aliased(r.relname ?? "", found.columns, r.alias), source: found.source }, problems: found.problems }
 		}
-		_ => { rel: { alias: "?", table: "?", columns: Unknown, nullable: Bool.False, hidden: [], not_null: [] }, problems: [] }
+		_ => { rel: aliased("?", Unknown, Null), problems: [] }
 	}
 
 ## A `returning` list over `rels`, the first of which is the target. `old`
@@ -2010,7 +2060,7 @@ insert_shape_problems = |source, listed, target, env| {
 				},
 		)
 	missing_problems =
-		match (env.catalog.table(target.table), widths.first()) {
+		match (target.source, widths.first()) {
 			(Ok({ columns: Known(catalog_columns), triggers: Bool.False, .. }), Ok(width)) => {
 				given = if listed.is_empty() catalog_columns.take_first(width).map(|c| c.name) else listed
 				catalog_columns
@@ -2230,17 +2280,23 @@ test_catalog : Catalog
 test_catalog = Catalog.parse(test_schema) ?? Catalog.none
 
 check : Str -> Check.Result
-check = |sql| {
+check = |sql| check_in(test_catalog, sql)
+
+check_in : Catalog, Str -> Check.Result
+check_in = |catalog, sql| {
 	toks = Lex.tokens(sql) ?? []
 	match Parse.parse(Lex.grammar_text(sql, toks)) {
-		Ok([stmt]) => Check.analyze(stmt, test_catalog, [], Lex.named_at(toks))
+		Ok([stmt]) => Check.analyze(stmt, catalog, [], Lex.named_at(toks))
 		_ => { outputs: Unknown, problems: ["not one statement"] }
 	}
 }
 
 outputs : Str -> List(Str)
-outputs = |sql|
-	match check(sql).outputs {
+outputs = |sql| outputs_in(test_catalog, sql)
+
+outputs_in : Catalog, Str -> List(Str)
+outputs_in = |catalog, sql|
+	match check_in(catalog, sql).outputs {
 		Known(list) =>
 			list.map(
 				|o| {
@@ -2443,3 +2499,29 @@ expect outputs("select j.id, j.tag, j.n from json_table('[]'::jsonb, '$[*]' colu
 expect outputs("select t.a, t.b from json_to_record('{}'::json) as t(a int, b text)") == ["a integer null?", "b text null?"]
 expect outputs("select g, ordinality from generate_series(1, 3) with ordinality as g") == ["g integer null?", "ordinality bigint"]
 expect outputs("select a, b from rows from (generate_series(1, 2), unnest(array['x'])) as t(a, b)") == ["a integer null?", "b text null?"]
+
+schemas_catalog : Catalog
+schemas_catalog =
+	Catalog.parse(
+		\\CREATE TABLE public.users (id integer NOT NULL, name text NOT NULL);
+		\\CREATE TABLE app.users (id bigint NOT NULL, email text NOT NULL);
+		\\CREATE TABLE app.posts (id bigint NOT NULL, title text NOT NULL);
+		\\CREATE FUNCTION app.greet(who text) RETURNS text LANGUAGE sql STRICT AS $$ select 'hi ' || who $$;
+		\\CREATE FUNCTION public.add_one(integer, integer) RETURNS integer LANGUAGE sql AS $$ select $1 + $2 $$;
+		\\CREATE AGGREGATE public.total(integer) (SFUNC = public.add_one, STYPE = integer);
+		\\CREATE FUNCTION public.everyone() RETURNS SETOF public.users LANGUAGE sql AS $$ select * from public.users $$;
+	)
+	?? Catalog.none
+
+# Tables and functions by schema and search path.
+expect outputs_in(schemas_catalog, "select id, name from users") == ["id integer", "name text"]
+expect outputs_in(schemas_catalog, "select id, email from app.users") == ["id bigint", "email text"]
+expect outputs_in(schemas_catalog.with_search_path(["app", "public"]), "select id, email from users") == ["id bigint", "email text"]
+expect check_in(schemas_catalog, "select title from posts").problems == ["table `posts` does not exist in the schema (did you mean `app.posts`? Its schema is not on the search path)"]
+expect check_in(schemas_catalog, "select id from app.user").problems == ["table `app.user` does not exist in the schema (did you mean `users`?)"]
+expect check_in(schemas_catalog, "select app.greet(name) from users").problems == []
+expect check_in(schemas_catalog, "select greet(name) from users").problems == ["function `greet` does not exist"]
+expect outputs_in(schemas_catalog.with_search_path(["app"]), "select greet(email) as g from users") == ["g text null?"]
+expect check_in(schemas_catalog, "select app.lower(name) from users").problems == ["function `lower` does not exist"]
+expect outputs_in(schemas_catalog, "select pg_catalog.lower(name) as l, total(id) as t from users") == ["l text", "t integer null?"]
+expect outputs_in(schemas_catalog, "select e.name from everyone() e") == ["name text null?"]

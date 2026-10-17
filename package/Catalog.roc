@@ -32,7 +32,7 @@ import Lex
 import Node
 import Parse
 
-Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions : List(Catalog.Function), extensions : List(Str), none : Bool }.{
+Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions : List(Catalog.Function), extensions : List(Str), none : Bool, search_path : List(Str) }.{
 	## A table or a view. A view's columns are the ones its query returns,
 	## which the analysis works out when a query reads it. `primary_key` is
 	## empty for a table without one. `triggers` is whether a trigger is
@@ -47,19 +47,34 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 	## or is generated.
 	Column : { name : Str, type : Str, not_null : Bool, has_default : Bool }
 
-	Enum : { name : Str, labels : List(Str) }
+	Enum : { name : Str, schema : Str, labels : List(Str) }
 
 	## A function of the schema. `args` are the types it takes, the last
 	## `defaults` of which may be left out. A function with several `OUT`
 	## parameters or `returns table` returns `record`, and `outputs` are its
-	## columns.
-	Function : { name : Str, args : List(Str), defaults : U64, variadic : Bool, result : Str, set : Bool, strict : Bool, outputs : List({ name : Str, type : Str }) }
+	## columns. `aggregate` is whether it is one, made by `create aggregate`.
+	Function : { name : Str, schema : Str, args : List(Str), defaults : U64, variadic : Bool, result : Str, set : Bool, strict : Bool, outputs : List({ name : Str, type : Str }), aggregate : Bool }
 
 	## No schema, the catalog of [NoSchema]. Queries are checked for syntax
 	## and parameters, but any table, column or function goes. A dump without
 	## tables is not this: its queries can name no table.
 	none : Catalog
-	none = Catalog.{ tables: [], enums: [], functions: [], extensions: [], none: Bool.True }
+	none = Catalog.{ tables: [], enums: [], functions: [], extensions: [], none: Bool.True, search_path: default_search_path }
+
+	## The schemas a name without one is looked for in, in order, as the
+	## server's `search_path` setting lists them. `["public"]` unless set
+	## with [Catalog.with_search_path].
+	search_path : Catalog -> List(Str)
+	search_path = |catalog| catalog.search_path
+
+	## The catalog for connections whose `search_path` is `schemas`, such
+	## as `["app", "public"]`. A table, view or function named without a
+	## schema is the one in the first of them that has it, after
+	## `pg_catalog`, as the server picks it. The setting must be the same on
+	## the server, by `alter role ... set search_path` or the `search_path`
+	## connection parameter.
+	with_search_path : Catalog, List(Str) -> Catalog
+	with_search_path = |catalog, schemas| { ..catalog, search_path: schemas }
 
 	is_none : Catalog -> Bool
 	is_none = |catalog| catalog.none
@@ -74,7 +89,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 	## The labels of enum type `name`, in their order.
 	enum_labels : Catalog, Str -> Try(List(Str), [NotFound])
 	enum_labels = |catalog, name|
-		match catalog.enums.find_first(|e| e.name == name) {
+		match in_path(catalog, catalog.enums, |e| e.name == name, |e| e.schema) {
 			Ok(e) => Ok(e.labels)
 			Err(_) => Err(NotFound)
 		}
@@ -82,13 +97,32 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 	functions : Catalog -> List(Catalog.Function)
 	functions = |catalog| catalog.functions
 
+	## The functions a call reaches: those of `schema` when the call names
+	## one, else those of every schema on the search path.
+	functions_in : Catalog, [Qualified(Str), Unqualified] -> List(Catalog.Function)
+	functions_in = |catalog, schema|
+		match schema {
+			Qualified(s) => catalog.functions.keep_if(|f| f.schema == s)
+			Unqualified => catalog.functions.keep_if(|f| catalog.search_path.contains(f.schema) or f.schema == "pg_catalog")
+		}
+
 	## The extensions the dump creates, other than `plpgsql`. Their functions,
 	## operators and types are not in the dump.
 	extensions : Catalog -> List(Str)
 	extensions = |catalog| catalog.extensions
 
+	## The table or view `name` in the first schema of the search path that
+	## has one.
 	table : Catalog, Str -> Try(Catalog.Table, [NotFound])
-	table = |catalog, name| catalog.tables.find_first(|t| t.name == name)
+	table = |catalog, name| Catalog.find_table(catalog, Unqualified, name)
+
+	## The table or view `name` of `schema`, or found on the search path.
+	find_table : Catalog, [Qualified(Str), Unqualified], Str -> Try(Catalog.Table, [NotFound])
+	find_table = |catalog, schema, name|
+		match schema {
+			Qualified(s) => catalog.tables.find_first(|t| t.name == name and t.schema == s)
+			Unqualified => in_path(catalog, catalog.tables, |t| t.name == name, |t| t.schema)
+		}
 
 	## Read a schema dump, as a top-level constant over an imported file (see
 	## the example above). It runs while the app builds, so a file that is
@@ -111,13 +145,18 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 		var $domains = []
 		var $functions = []
 		var $extensions = []
+		# A table altered or given a trigger is matched by its schema too.
+		same = |t, rel| t.name == rel.name and t.schema == rel.schema
 		for statement in statements(sql, toks) {
 			if wanted(statement.kinds) {
 				match Parse.parse(statement.text) {
 					Ok([RawStmt(raw)]) =>
 						match raw.stmt {
 							CreateStmt(s) => {
-								$tables = $tables.append(create_table(s))
+								$tables = $tables.append(create_table(s, $tables))
+							}
+							CreateForeignTableStmt({ base: CreateStmt(s), .. }) => {
+								$tables = $tables.append(create_table(s, $tables))
 							}
 							ViewStmt(v) => {
 								{ name, schema } = relation_name(v.view)
@@ -132,22 +171,28 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 									_ => {}
 								}
 							AlterTableStmt(a) => {
-								{ name, .. } = relation_name(a.relation)
-								$tables = $tables.map(|t| if t.name == name alter_table(t, a.cmds) else t)
+								rel = relation_name(a.relation)
+								$tables = $tables.map(|t| if same(t, rel) alter_table(t, a.cmds) else t)
 							}
 							CreateEnumStmt(e) => {
-								$enums = $enums.append({ name: names_of(e.type_name).last() ?? "", labels: names_of(e.vals) })
+								{ name, schema } = qualified_name(e.type_name)
+								$enums = $enums.append({ name, schema, labels: names_of(e.vals) })
 							}
 							CreateDomainStmt(d) => {
+								{ name, schema } = qualified_name(d.domainname)
 								not_null = d.constraints.any(|c| constraint_type(c) == Enums.constr_notnull)
-								$domains = $domains.append({ name: names_of(d.domainname).last() ?? "", base: Catalog.type_name(d.type_name), not_null })
+								has_default = d.constraints.any(|c| constraint_type(c) == Enums.constr_default)
+								$domains = $domains.append({ name, schema, base: Catalog.type_name(d.type_name), not_null, has_default })
 							}
 							CreateFunctionStmt(f) if !f.is_procedure => {
 								$functions = $functions.append(create_function(f))
 							}
+							DefineStmt(d) if d.kind == Enums.object_aggregate => {
+								$functions = $functions.append(create_aggregate(d, $functions))
+							}
 							CreateTrigStmt(trigger) => {
-								{ name, .. } = relation_name(trigger.relation)
-								$tables = $tables.map(|t| if t.name == name { ..t, triggers: Bool.True } else t)
+								rel = relation_name(trigger.relation)
+								$tables = $tables.map(|t| if same(t, rel) { ..t, triggers: Bool.True } else t)
 							}
 							CreateExtensionStmt(e) if e.extname != Ok("plpgsql") => {
 								$extensions = $extensions.append(e.extname ?? "")
@@ -170,7 +215,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 					_ => t
 				},
 		)
-		Ok(Catalog.{ tables: resolved, enums: $enums, functions: $functions, extensions: $extensions, none: Bool.False })
+		Ok(Catalog.{ tables: resolved, enums: $enums, functions: $functions, extensions: $extensions, none: Bool.False, search_path: default_search_path })
 	}
 
 	## The type a `TypeName` node names, spelled as `pg_dump` spells column
@@ -185,6 +230,38 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 			}
 			_ => ""
 		}
+}
+
+## The server's default `search_path` without `"$user"`, a schema named
+## after the user, which a schema dump does not tell.
+default_search_path : List(Str)
+default_search_path = ["public"]
+
+## The first of `items` that `matches` in the search path's order, with
+## `pg_catalog` first.
+in_path : Catalog, List(a), (a -> Bool), (a -> Str) -> Try(a, [NotFound])
+in_path = |catalog, items, matches, schema_of| {
+	found = items.keep_if(matches)
+	["pg_catalog"].concat(catalog.search_path()).fold(
+		Err(NotFound),
+		|acc, schema|
+			match acc {
+				Ok(_) => acc
+				Err(_) => found.find_first(|item| schema_of(item) == schema)
+			},
+	)
+}
+
+## A name of a type or a function: `public.access_level` or `access_level`,
+## which the dump means in `public`.
+qualified_name : List(Node) -> { name : Str, schema : Str }
+qualified_name = |nodes| {
+	names = names_of(nodes)
+	match names {
+		[.., schema, name] => { name, schema }
+		[name] => { name, schema: "public" }
+		_ => { name: "", schema: "" }
+	}
 }
 
 ## The grammar's internal name of a built in type, as `pg_dump` writes it.
@@ -208,12 +285,12 @@ canonical_type = |name|
 		_ => name
 	}
 
-Domain : { name : Str, base : Str, not_null : Bool }
+Domain : { name : Str, schema : Str, base : Str, not_null : Bool, has_default : Bool }
 
 resolve_domain : Catalog.Column, List(Domain) -> Catalog.Column
 resolve_domain = |column, domains|
 	match domains.find_first(|d| d.name == column.type) {
-		Ok(domain) => { ..column, type: domain.base, not_null: column.not_null or domain.not_null }
+		Ok(domain) => { ..column, type: domain.base, not_null: column.not_null or domain.not_null, has_default: column.has_default or domain.has_default }
 		Err(_) => column
 	}
 
@@ -224,14 +301,22 @@ without_meta_commands : Str -> Str
 without_meta_commands = |sql| Str.join_with(sql.split_on("\n").map(|line| if line.starts_with("\\") "" else line), "\n")
 
 ## The statements of a dump: the text of each, where it starts and its
-## tokens' kinds.
+## tokens' kinds. A `;` ends a statement unless it is inside parentheses or
+## the `begin atomic ... end` body of a function or procedure, which psql
+## finds by counting `begin`, `case` and `end` in a statement that starts
+## with `create [or replace] function` or `procedure`.
 statements : Str, List(Lex.Token) -> List({ text : Str, start : U64, kinds : List(Lex.Kind) })
 statements = |sql, toks| {
 	bytes = sql.to_utf8()
 	var $out = []
 	var $current = []
+	var $parens = 0.U64
+	var $begins = 0.U64
+	var $routine = Bool.False
 	for tok in toks.append({ kind: Punct(';'), start: bytes.len(), end: bytes.len() }) {
-		if tok.kind == Punct(';') {
+		# The `;` added at the end ends the last statement whatever is open.
+		at_end = tok.start == bytes.len() and tok.end == bytes.len()
+		if tok.kind == Punct(';') and (($parens == 0 and $begins == 0) or at_end) {
 			match ($current.first(), $current.last()) {
 				(Ok(first), Ok(last)) => {
 					text = Str.from_utf8_lossy(bytes.sublist({ start: first.start, len: last.end - first.start }))
@@ -240,24 +325,52 @@ statements = |sql, toks| {
 				_ => {}
 			}
 			$current = []
+			$routine = Bool.False
 		} else {
 			$current = $current.append(tok)
+			# The first four words tell.
+			if $current.len() <= 4 {
+				$routine = creates_routine($current.map(|t| t.kind))
+			}
+			if tok.kind == Punct('(') {
+				$parens = $parens + 1
+			} else if tok.kind == Punct(')') and $parens > 0 {
+				$parens = $parens - 1
+			} else if $parens == 0 and $routine {
+				if tok.kind == Word("begin") {
+					$begins = $begins + 1
+				} else if tok.kind == Word("case") and $begins > 0 {
+					$begins = $begins + 1
+				} else if tok.kind == Word("end") and $begins > 0 {
+					$begins = $begins - 1
+				}
+			}
 		}
 	}
 	$out
 }
 
+creates_routine : List(Lex.Kind) -> Bool
+creates_routine = |kinds|
+	match kinds {
+		[Word("create"), Word("function"), ..] | [Word("create"), Word("procedure"), ..] => Bool.True
+		[Word("create"), Word("or"), Word("replace"), Word("function"), ..] | [Word("create"), Word("or"), Word("replace"), Word("procedure"), ..] => Bool.True
+		_ => Bool.False
+	}
+
 ## Whether a statement can describe a table, a view, an enum, a domain, a
-## function, a trigger or an extension. Only those are parsed, which keeps reading a dump cheap.
+## function, an aggregate, a trigger or an extension. Only those are
+## parsed, which keeps reading a dump cheap.
 wanted : List(Lex.Kind) -> Bool
 wanted = |kinds|
 	match kinds {
-		[Word("create"), Word("table"), ..] | [Word("create"), Word("unlogged"), Word("table"), ..] => Bool.True
+		[Word("create"), Word("table"), ..] | [Word("create"), Word("unlogged"), Word("table"), ..] | [Word("create"), Word("foreign"), Word("table"), ..] => Bool.True
 		[Word("create"), Word("view"), ..] | [Word("create"), Word("or"), Word("replace"), Word("view"), ..] => Bool.True
 		[Word("create"), Word("materialized"), Word("view"), ..] => Bool.True
 		[Word("create"), Word("type"), ..] => kinds.contains(Word("enum"))
 		[Word("create"), Word("domain"), ..] => Bool.True
 		[Word("create"), Word("function"), ..] | [Word("create"), Word("or"), Word("replace"), Word("function"), ..] => Bool.True
+		[Word("create"), Word("aggregate"), ..] | [Word("create"), Word("or"), Word("replace"), Word("aggregate"), ..] => Bool.True
 		[Word("alter"), Word("table"), ..] => kinds.contains(Word("primary")) or kinds.contains(Word("null")) or kinds.contains(Word("column"))
 		[Word("create"), Word("trigger"), ..] | [Word("create"), Word("constraint"), Word("trigger"), ..] | [Word("create"), Word("or"), Word("replace"), Word("trigger"), ..] => Bool.True
 		[Word("create"), Word("extension"), ..] => Bool.True
@@ -271,39 +384,76 @@ relation_name = |node|
 		_ => { name: "", schema: "" }
 	}
 
-## A table's columns and primary key. A table that inherits another one's
-## columns, or takes them from a type or `like`, has columns this does not
-## see, so they are unknown.
-create_table : Node.CreateStmt -> Catalog.Table
-create_table = |s| {
+## A table's columns and primary key. A table that inherits, a partition
+## and a table made `like` another one start with that one's columns, read
+## earlier in the dump (`pg_dump` writes parents first). A column of its
+## own with the name of one of those adds its constraints to it. A table of
+## a composite type, or of a parent this has not read, has columns this
+## does not know.
+create_table : Node.CreateStmt, List(Catalog.Table) -> Catalog.Table
+create_table = |s, earlier| {
 	{ name, schema } = relation_name(s.relation)
 	constraints = s.table_elts.concat(s.constraints).concat(s.nnconstraints)
 	primary_key = constraints.fold([], |acc, c| if constraint_type(c) == Enums.constr_primary acc.concat(constraint_keys(c)) else acc)
 	not_null = constraints.fold([], |acc, c| if constraint_type(c) == Enums.constr_notnull acc.concat(constraint_keys(c)) else acc)
-	defined = s.table_elts.keep_oks(
-		|elt|
-			match elt {
-				ColumnDef(c) => Ok(column(c))
-				_ => Err(NotAColumn)
-			},
-	)
-	others =
-		s.table_elts.any(
-			|elt|
-				match elt {
-					ColumnDef(_) => Bool.False
-					Constraint(_) => Bool.False
-					_ => Bool.True
-				},
-		)
+	parent_columns = |node|
+		match node {
+			RangeVar(_) => {
+				rel = relation_name(node)
+				match earlier.find_first(|t| t.name == rel.name and t.schema == rel.schema) {
+					Ok({ columns: Known(columns), .. }) => Ok(columns)
+					_ => Err(Unread)
+				}
+			}
+			_ => Err(Unread)
+		}
+	inherited = s.inh_relations.map(parent_columns)
 	columns =
-		if others or !s.inh_relations.is_empty() or s.partbound != Null or s.of_typename != Null {
+		if s.of_typename != Null or inherited.any(
+			|p|
+				match p {
+					Ok(_) => Bool.False
+					Err(_) => Bool.True
+				},
+		) {
 			Unknown
 		} else {
-			Known(defined.map(|c| if primary_key.contains(c.name) or not_null.contains(c.name) { ..c, not_null: Bool.True } else c))
+			start = inherited.fold([], |acc, p| acc.concat(p ?? []))
+			s.table_elts.fold(
+				Known(start),
+				|acc, elt|
+					match (acc, elt) {
+						(Known(so_far), ColumnDef(c)) => {
+							own = column(c)
+							if so_far.any(|existing| existing.name == own.name) {
+								Known(so_far.map(|existing| if existing.name == own.name { ..existing, not_null: existing.not_null or own.not_null, has_default: existing.has_default or own.has_default } else existing))
+							} else {
+								Known(so_far.append(own))
+							}
+						}
+						(Known(so_far), TableLikeClause(like)) =>
+							match parent_columns(like.relation) {
+								Ok(copied) => Known(so_far.concat(copied.map(|c| { ..c, has_default: c.has_default and like.options.bitwise_and(like_defaults) != 0 })))
+								Err(_) => Unknown
+							}
+						(Known(so_far), Constraint(_)) => Known(so_far)
+						_ => Unknown
+					},
+			)
 		}
-	{ name, schema, columns, primary_key, triggers: Bool.False }
+	marked =
+		match columns {
+			Known(list) => Known(list.map(|c| if primary_key.contains(c.name) or not_null.contains(c.name) { ..c, not_null: Bool.True } else c))
+			other => other
+		}
+	{ name, schema, columns: marked, primary_key, triggers: Bool.False }
 }
+
+## `including defaults`, `identity` and `generated` of a `like` clause, the
+## options that copy what lets an insert leave a column out
+## (`CREATE_TABLE_LIKE_DEFAULTS`, `_GENERATED` and `_IDENTITY`).
+like_defaults : I64
+like_defaults = 8 + 16 + 32
 
 column : Node.ColumnDef -> Catalog.Column
 column = |c| {
@@ -410,8 +560,10 @@ create_function = |f| {
 				_ => Bool.False
 			},
 	)
+	{ name, schema } = qualified_name(f.funcname)
 	{
-		name: names_of(f.funcname).last() ?? "",
+		name,
+		schema,
 		args: inputs.map(|p| Catalog.type_name(p.arg_type)),
 		defaults: inputs.count_if(|p| p.defexpr != Null),
 		variadic: inputs.any(|p| p.mode == Enums.func_param_variadic),
@@ -419,6 +571,58 @@ create_function = |f| {
 		set,
 		strict,
 		outputs: if outputs.len() > 1 outputs else [],
+		aggregate: Bool.False,
+	}
+}
+
+## `create aggregate name (types) (sfunc = ..., stype = ...)`. It returns
+## what its `finalfunc`, one read earlier in the dump, returns, or else its
+## state type.
+create_aggregate : Node.DefineStmt, List(Catalog.Function) -> Catalog.Function
+create_aggregate = |d, earlier| {
+	{ name, schema } = qualified_name(d.defnames)
+	# The arguments, then the number of direct ones of an ordered-set
+	# aggregate, or nothing in the old syntax.
+	params =
+		match d.args {
+			[NodeList(items), ..] =>
+				items.keep_oks(
+					|p|
+						match p {
+							FunctionParameter(param) => Ok(param)
+							_ => Err(NotAParameter)
+						},
+				)
+			_ => []
+		}
+	option = |key|
+		d.definition.keep_oks(
+			|o|
+				match o {
+					DefElem(e) if e.defname == Ok(key) => Ok(e.arg)
+					_ => Err(NotThere)
+				},
+		).first()
+	state_type = option("stype").map_ok(Catalog.type_name) ?? ""
+	result =
+		match option("finalfunc") {
+			Ok(TypeName(t)) => {
+				final = qualified_name(t.names)
+				earlier.find_first(|f| f.name == final.name and f.schema == final.schema).map_ok(|f| f.result) ?? ""
+			}
+			_ => state_type
+		}
+	{
+		name,
+		schema,
+		args: params.map(|p| Catalog.type_name(p.arg_type)),
+		defaults: 0,
+		variadic: params.any(|p| p.mode == Enums.func_param_variadic),
+		result,
+		set: Bool.False,
+		strict: Bool.False,
+		outputs: [],
+		aggregate: Bool.True,
 	}
 }
 
@@ -506,8 +710,8 @@ expect {
 	catalog = Catalog.parse(sample) ?? Catalog.none
 	catalog.functions()
 	== [
-		{ name: "full_name", args: ["text", "text"], defaults: 1, variadic: Bool.False, result: "text", set: Bool.False, strict: Bool.True, outputs: [] },
-		{ name: "school_stats", args: ["text"], defaults: 0, variadic: Bool.False, result: "record", set: Bool.False, strict: Bool.False, outputs: [{ name: "n", type: "bigint" }, { name: "newest", type: "timestamp with time zone" }] },
+		{ name: "full_name", schema: "public", args: ["text", "text"], defaults: 1, variadic: Bool.False, result: "text", set: Bool.False, strict: Bool.True, outputs: [], aggregate: Bool.False },
+		{ name: "school_stats", schema: "public", args: ["text"], defaults: 0, variadic: Bool.False, result: "record", set: Bool.False, strict: Bool.False, outputs: [{ name: "n", type: "bigint" }, { name: "newest", type: "timestamp with time zone" }], aggregate: Bool.False },
 	]
 }
 
@@ -540,3 +744,73 @@ expect Catalog.parse("\\restrict abc\nCREATE TYPE public.mood AS ENUM ('ok');\nC
 expect Catalog.parse("CREATE TABLE public.x (id integer); CREATE INDEX nope ON;").map_ok(|c| c.tables().len()) == Ok(1)
 expect Catalog.parse("").map_ok(|c| c.is_none()) == Ok(Bool.False)
 expect Catalog.none.is_none()
+
+# Schemas: a name without one is looked for on the search path, and a
+# statement of the dump changes the table of its own schema only.
+expect {
+	dump =
+		\\CREATE TABLE public.users (id integer NOT NULL, name text);
+		\\CREATE TABLE app.users (id bigint NOT NULL, email text);
+		\\ALTER TABLE ONLY app.users ALTER COLUMN email SET NOT NULL;
+		\\CREATE TRIGGER t BEFORE INSERT ON app.users FOR EACH ROW EXECUTE FUNCTION app.f();
+	catalog = Catalog.parse(dump) ?? Catalog.none
+	in_app = catalog.with_search_path(["app", "public"])
+	columns = |c, schema| c.find_table(schema, "users").map_ok(|t| (t.schema, t.triggers, t.columns))
+	columns(catalog, Unqualified) == Ok(("public", Bool.False, Known([{ name: "id", type: "integer", not_null: Bool.True, has_default: Bool.False }, { name: "name", type: "text", not_null: Bool.False, has_default: Bool.False }])))
+	and columns(in_app, Unqualified) == Ok(("app", Bool.True, Known([{ name: "id", type: "bigint", not_null: Bool.True, has_default: Bool.False }, { name: "email", type: "text", not_null: Bool.True, has_default: Bool.False }])))
+	and catalog.find_table(Qualified("app"), "users").map_ok(|t| t.schema) == Ok("app")
+	and catalog.find_table(Qualified("other"), "users").map_ok(|t| t.schema) == Err(NotFound)
+}
+
+# A `begin atomic` body holds statements of its own.
+expect {
+	dump =
+		\\CREATE FUNCTION public.answer() RETURNS integer
+		\\    LANGUAGE sql
+		\\    BEGIN ATOMIC
+		\\ SELECT CASE WHEN true THEN 42 ELSE 0 END;
+		\\ SELECT 1;
+		\\END;
+		\\CREATE TABLE public.after (id integer);
+	catalog = Catalog.parse(dump) ?? Catalog.none
+	catalog.functions().map(|f| (f.name, f.result)) == [("answer", "integer")]
+	and catalog.tables().map(|t| t.name) == ["after"]
+}
+
+# Columns a table gets from another one, and other ways a dump makes them.
+expect {
+	dump =
+		\\CREATE DOMAIN public.stamp AS timestamp with time zone DEFAULT now() NOT NULL;
+		\\CREATE TABLE public.base (id integer NOT NULL, at public.stamp, note text DEFAULT 'x');
+		\\CREATE TABLE public.child (extra text, note text NOT NULL) INHERITS (public.base);
+		\\CREATE TABLE public.copy (LIKE public.base, more integer);
+		\\CREATE TABLE public.copy_all (LIKE public.base INCLUDING ALL);
+		\\CREATE TABLE public.part (id integer NOT NULL, region text) PARTITION BY LIST (region);
+		\\CREATE TABLE public.part_eu PARTITION OF public.part (region NOT NULL) FOR VALUES IN ('eu');
+		\\CREATE FOREIGN TABLE public.remote (id integer NOT NULL) SERVER elsewhere;
+		\\CREATE TABLE public.orphan (id integer) INHERITS (public.missing);
+	catalog = Catalog.parse(dump) ?? Catalog.none
+	shape = |name|
+		match catalog.table(name) {
+			Ok({ columns: Known(columns), .. }) => columns.map(|c| "${c.name} ${c.type}${if c.not_null " not null" else ""}${if c.has_default " default" else ""}")
+			_ => ["unknown"]
+		}
+	shape("base") == ["id integer not null", "at timestamp with time zone not null default", "note text default"]
+	and shape("child") == ["id integer not null", "at timestamp with time zone not null default", "note text not null default", "extra text"]
+	and shape("copy") == ["id integer not null", "at timestamp with time zone not null default", "note text", "more integer"]
+	and shape("copy_all") == ["id integer not null", "at timestamp with time zone not null default", "note text default"]
+	and shape("part_eu") == ["id integer not null", "region text not null"]
+	and shape("remote") == ["id integer not null"]
+	and shape("orphan") == ["unknown"]
+}
+
+# An aggregate of the schema.
+expect {
+	dump =
+		\\CREATE FUNCTION public.add_one(integer, integer) RETURNS integer LANGUAGE sql AS $$ select $1 + $2 $$;
+		\\CREATE FUNCTION public.shout(integer) RETURNS text LANGUAGE sql AS $$ select $1::text $$;
+		\\CREATE AGGREGATE public.total(integer) (SFUNC = public.add_one, STYPE = integer);
+		\\CREATE AGGREGATE public.loud(integer) (SFUNC = public.add_one, STYPE = integer, FINALFUNC = public.shout);
+	catalog = Catalog.parse(dump) ?? Catalog.none
+	catalog.functions().keep_if(|f| f.aggregate).map(|f| (f.name, f.args, f.result)) == [("total", ["integer"], "integer"), ("loud", ["integer"], "text")]
+}

@@ -42,9 +42,14 @@ Overload :: [].{
 	## `schema_functions`, those of the app's schema. `enums` are the
 	## schema's enum types, for `anyenum`.
 	function : Str, List(Overload.Arg), List(Str), List(Catalog.Function) -> Try(Overload.Choice, Overload.Miss)
-	function = |name, args, enums, schema_functions| {
+	function = |name, args, enums, schema_functions| Overload.function_from(name, args, enums, Bool.True, schema_functions)
+
+	## [Overload.function], from the built in functions only when
+	## `builtins`, as for a call that names no schema or `pg_catalog`.
+	function_from : Str, List(Overload.Arg), List(Str), Bool, List(Catalog.Function) -> Try(Overload.Choice, Overload.Miss)
+	function_from = |name, args, enums, builtins, schema_functions| {
 		arity = args.len()
-		builtin = lines_named(Builtins.functions, name).keep_oks(builtin_declared)
+		builtin = if builtins lines_named(Builtins.functions, name).keep_oks(builtin_declared) else []
 		declared = builtin.concat(schema_functions.keep_if(|f| f.name == name).map(schema_declared))
 		candidates = declared.keep_oks(|d| function_candidate(d, arity))
 		args_known = args.map(|a| known_arg(a, enums))
@@ -211,7 +216,7 @@ builtin_declared = |fields|
 ## A function of the app's schema. One with several output columns returns
 ## `record`.
 schema_declared : Catalog.Function -> Declared
-schema_declared = |f| { name: f.name, args: f.args, defaults: f.defaults, variadic: f.variadic, result: f.result, strict: f.strict, kind: Plain, set: f.set, outputs: f.outputs }
+schema_declared = |f| { name: f.name, args: f.args, defaults: f.defaults, variadic: f.variadic, result: f.result, strict: f.strict, kind: if f.aggregate Aggregate else Plain, set: f.set, outputs: f.outputs }
 
 ## The declared function as a candidate for a call with `arity` arguments.
 ## A variadic function takes one or more of its last parameter's element
