@@ -142,7 +142,7 @@ Lookup : [Found(Check.Output), Missing(Str), Unsure]
 no_outputs : Check.Result
 no_outputs = { outputs: Unknown, problems: [] }
 
-## The type a bounded domain is of, or `type` itself.
+## The type a domain is of, or `type` itself.
 base_in : Catalog, Str -> Str
 base_in = |catalog, type|
 	if type.ends_with("[]") {
@@ -155,12 +155,13 @@ base_in = |catalog, type|
 values_in : Catalog, Str -> PgType.Values
 values_in = |catalog, type|
 	match catalog.domain(type) {
-		Ok(d) => Integers(d.low, d.high)
+		Ok({ bounds: Bounded(low, high), .. }) => Integers(low, high)
+		Ok(d) => PgType.values(d.base)
 		Err(_) => PgType.values(type)
 	}
 
-## An argument as picking a function or operator sees it: a bounded
-## domain is its base type.
+## An argument as picking a function or operator sees it: a domain is its
+## base type.
 base_arg : Overload.Arg, Env -> Overload.Arg
 base_arg = |arg, env|
 	match arg {
@@ -1025,7 +1026,19 @@ walk = |node, rels, env| {
 		TypeCast(t) => {
 			inner = sub(t.arg)
 			name = if inner.output.name == "?column?" type_last_name(t.type_name) else inner.output.name
-			value = over({ name, type: type_of(t.type_name), nullable: inner.output.nullable }, [inner])
+			cast = type_of(t.type_name)
+			# A cast to a `NOT NULL` domain fails on NULL, so what it gives is not.
+			# A column of a domain has its base type, unless the domain bounds it.
+			{ type, nullable } =
+				match cast {
+					Known(c) =>
+						match env.catalog.domain(c) {
+							Ok(d) => { type: Known(if d.bounds == Unbounded d.base else c), nullable: if d.not_null No else inner.output.nullable }
+							Err(_) => { type: cast, nullable: inner.output.nullable }
+						}
+					Unknown => { type: cast, nullable: inner.output.nullable }
+				}
+			value = over({ name, type, nullable }, [inner])
 			{ ..value, problems: cast_param_problems(t, env).concat(inner.problems) }
 		}
 		CollateClause(c) => {

@@ -233,6 +233,7 @@ domain_catalog =
 		\\CREATE DOMAIN public.u8 AS smallint CONSTRAINT u8_check CHECK (((VALUE >= 0) AND (VALUE <= 255)));
 		\\CREATE DOMAIN public.percent AS integer CHECK (VALUE BETWEEN 0 AND 100);
 		\\CREATE DOMAIN public.signed AS integer CHECK (VALUE >= '-5'::integer) CHECK (VALUE <= 5);
+		\\CREATE DOMAIN public.present AS integer NOT NULL;
 		\\CREATE TABLE public.pixels (red public.u8 NOT NULL, done public.percent NOT NULL, tilt public.signed NOT NULL, big bigint NOT NULL, small smallint NOT NULL);
 	)
 	?? Catalog.none
@@ -254,3 +255,6 @@ expect in_domains("update pixels set small = $s", [field("s", "I32", Bool.False)
 # `Try` field.
 expect checked("select (array[id])[1] as x from students", [], [field("x", "I32", Bool.False)]) == Err("column `x` may be NULL as far as the query shows, so its field needs to be `Try(I32, [Null])`, or the query must show it is not, see \"Telling the checker more\" in the README")
 expect checked("select coalesce((array[id])[1], 0) as x from students", [], [field("x", "I32", Bool.False)]) == Ok({ text: "select coalesce((array[id])[1], 0) as x from students", params: [] })
+expect in_domains("select (array[small])[1]::present as p from pixels", [], [field("p", "I32", Bool.False)]) == Ok({})
+expect in_domains("select (array[small])[1]::integer as p from pixels", [], [field("p", "I32", Bool.False)]) == Err("column `p` may be NULL as far as the query shows, so its field needs to be `Try(I32, [Null])`, or the query must show it is not, see \"Telling the checker more\" in the README")
+expect in_domains("select (array[small])[1]::u8 as p from pixels", [], [field("p", "U8", Bool.True)]) == Ok({})

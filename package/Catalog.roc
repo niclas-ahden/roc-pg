@@ -50,12 +50,13 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), domains :
 
 	Enum : { name : Str, schema : Str, labels : List(Str) }
 
-	## A domain whose `check` constraints bound its integers, as
+	## A domain: its base type, whether it is `NOT NULL`, and the bounds of
+	## its integers when its `check` constraints set them, as
 	## `create domain u8 as smallint check (value between 0 and 255)` does.
-	## A column of it has the domain's name for its type, so that a field
-	## of a narrower Roc type, a `U8` here, takes it. A column of any other
-	## domain has the domain's base type.
-	Domain : { name : Str, schema : Str, base : Str, low : I128, high : I128 }
+	## A column of a bounded domain has the domain's name for its type, so
+	## that a field of a narrower Roc type, a `U8` here, takes it. A column of
+	## any other domain has the domain's base type.
+	Domain : { name : Str, schema : Str, base : Str, not_null : Bool, bounds : [Bounded(I128, I128), Unbounded] }
 
 	## A function of the schema. `args` are the types it takes, the last
 	## `defaults` of which may be left out. A function with several `OUT`
@@ -102,7 +103,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), domains :
 			Err(_) => Err(NotFound)
 		}
 
-	## The domain `name` that bounds its integers, found on the search path.
+	## The domain `name`, found on the search path.
 	domain : Catalog, Str -> Try(Catalog.Domain, [NotFound])
 	domain = |catalog, name| in_path(catalog, catalog.domains, |d| d.name == name, |d| d.schema)
 
@@ -228,14 +229,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), domains :
 					_ => t
 				},
 		)
-		bounded = domains.keep_oks(
-			|d|
-				match d.bounds {
-					Bounded(low, high) => Ok({ name: d.name, schema: d.schema, base: d.base, low, high })
-					Unbounded => Err(Unbounded)
-				},
-		)
-		Ok(Catalog.{ tables: resolved, enums: $enums, domains: bounded, functions: $functions, extensions: $extensions, none: Bool.False, search_path: default_search_path })
+		Ok(Catalog.{ tables: resolved, enums: $enums, domains: domains.map(|d| { name: d.name, schema: d.schema, base: d.base, not_null: d.not_null, bounds: d.bounds }), functions: $functions, extensions: $extensions, none: Bool.False, search_path: default_search_path })
 	}
 
 	## The type a `TypeName` node names, spelled as `pg_dump` spells column
