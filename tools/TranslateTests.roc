@@ -93,3 +93,27 @@ expect {
 	r = translation("{ N *p = makeNode(N); N *q = p; q->x = 1; q->y = 2; return p; }")
 	r.problems.is_empty() and !r.code.contains("x: 1, y: 2") and r.code.contains("$p = $q")
 }
+
+# Code after an error report never runs, and roc warns about it. The error
+# becomes the final value.
+expect {
+	r = translation("{ if (v) return n; ereport(ERROR, (errmsg(\"no\"))); return NULL; }")
+	r.problems.is_empty() and r.code.contains("\tErr(Rt.error(ctx, \"XX000\", Ok(\"no\"), (0 - 1)))\n}") and !r.code.contains("Ok(Null)")
+}
+
+# A switch whose every case leaves, default included, ends the function.
+expect {
+	r = translation("{ switch (v) { case 1: return n; default: ereport(ERROR, (errmsg(\"no\"))); } return NULL; }")
+	r.problems.is_empty() and !r.code.contains("return ") and r.code.contains("\t\tOk(n_arg)\n") and !r.code.contains("Ok(Null)")
+}
+
+# A case that breaks, or a missing default, lets control reach the code after.
+expect {
+	r = translation("{ switch (v) { case 1: if (v) break; return n; default: return n; } return NULL; }")
+	r.problems.is_empty() and r.code.contains("return Ok(n_arg)") and r.code.contains("\tOk(Null)\n}")
+}
+
+expect {
+	r = translation("{ switch (v) { case 1: return n; } return NULL; }")
+	r.problems.is_empty() and r.code.contains("return Ok(n_arg)") and r.code.contains("\tOk(Null)\n}")
+}

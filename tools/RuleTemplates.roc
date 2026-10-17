@@ -155,3 +155,10 @@ expect {
 		Err(_) => Bool.False
 	}
 }
+
+# An action that always fails ends in its error: no result, and no literal
+# slots for the code after the error that never runs.
+expect {
+	a = template("{ ereport(ERROR, (errmsg(\"no\"))); yyval.ival = FIRST; }")
+	a.problems.is_empty() and a.args.is_empty() and !a.body.contains("result") and !a.body.contains("return ") and a.body.contains("\tErr(Rt.error(ctx, \"XX000\", Ok(\"no\"), (0 - 1)))\n}")
+}

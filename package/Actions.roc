@@ -892,7 +892,7 @@ Actions :: [].{
 			# key_match: MATCH FULL
 			565 => rule_143(ctx, v, l, loc, 102)
 			# key_match: MATCH PARTIAL
-			566 => rule_566(ctx, v, l, loc, 112)
+			566 => rule_566(ctx, v, l, loc)
 			# key_match: MATCH SIMPLE
 			567 => rule_143(ctx, v, l, loc, 115)
 			# key_match: %empty
@@ -4815,9 +4815,7 @@ rule_157 = |_ctx, v, l, _loc| {
 rule_158 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
 rule_158 = |ctx, _v, l, _loc| {
 	l1 = Rt.location(l, 0)
-	result = Null
-	return Err(Rt.error(ctx, "0A000", Ok("UNENCRYPTED PASSWORD is no longer supported"), l1))
-	Ok(Rt.of_node(result))
+	Err(Rt.error(ctx, "0A000", Ok("UNENCRYPTED PASSWORD is no longer supported"), l1))
 }
 
 ## AlterOptRoleElem: INHERIT
@@ -5213,12 +5211,9 @@ rule_213 = |_ctx, v, _l, _loc, literal_0, literal_1, literal_2| {
 
 ## set_rest_more: CATALOG_P Sconst
 rule_214 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
-rule_214 = |ctx, v, l, _loc| {
+rule_214 = |ctx, _v, l, _loc| {
 	l2 = Rt.location(l, 1)
-	var $result = Rt.node_at(v, 0)
-	return Err(Rt.error(ctx, "0A000", Ok("current database cannot be changed"), l2))
-	$result = Null
-	Ok(Rt.of_node($result))
+	Err(Rt.error(ctx, "0A000", Ok("current database cannot be changed"), l2))
 }
 
 ## set_rest_more: SCHEMA Sconst
@@ -7318,13 +7313,10 @@ rule_563 = |_ctx, v, _l, _loc| {
 }
 
 ## key_match: MATCH PARTIAL
-rule_566 : Rt.Ctx, List(Rt.Value), List(I64), I64, I64 -> Try(Rt.Value, Scan.Problem)
-rule_566 = |ctx, v, l, _loc, literal_0| {
+rule_566 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
+rule_566 = |ctx, _v, l, _loc| {
 	l1 = Rt.location(l, 0)
-	var $result = Rt.int_at(v, 0)
-	return Err(Rt.error(ctx, "0A000", Ok("MATCH PARTIAL not yet implemented"), l1))
-	$result = literal_0
-	Ok(Rt.of_int($result))
+	Err(Rt.error(ctx, "0A000", Ok("MATCH PARTIAL not yet implemented"), l1))
 }
 
 ## ExclusionConstraintList: ExclusionConstraintElem
@@ -8073,9 +8065,7 @@ rule_690 = |_ctx, v, l, _loc| {
 rule_691 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
 rule_691 = |ctx, _v, l, _loc| {
 	l1 = Rt.location(l, 0)
-	result = Null
-	return Err(Rt.error(ctx, "0A000", Ok("CREATE EXTENSION ... FROM is no longer supported"), l1))
-	Ok(Rt.of_node(result))
+	Err(Rt.error(ctx, "0A000", Ok("CREATE EXTENSION ... FROM is no longer supported"), l1))
 }
 
 ## create_extension_opt_item: CASCADE
@@ -8865,12 +8855,9 @@ rule_842 = |_ctx, v, _l, _loc| {
 
 ## CreateAssertionStmt: CREATE ASSERTION any_name CHECK '(' a_expr ')' ConstraintAttributeSpec
 rule_847 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
-rule_847 = |ctx, v, l, _loc| {
+rule_847 = |ctx, _v, l, _loc| {
 	l1 = Rt.location(l, 0)
-	var $result = Rt.node_at(v, 0)
-	return Err(Rt.error(ctx, "0A000", Ok("CREATE ASSERTION is not yet implemented"), l1))
-	$result = Null
-	Ok(Rt.of_node($result))
+	Err(Rt.error(ctx, "0A000", Ok("CREATE ASSERTION is not yet implemented"), l1))
 }
 
 ## DefineStmt: CREATE opt_or_replace AGGREGATE func_name aggr_args definition
@@ -9078,9 +9065,7 @@ rule_886 = |_ctx, v, _l, _loc| {
 rule_887 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
 rule_887 = |ctx, _v, l, _loc| {
 	l4 = Rt.location(l, 3)
-	result = Null
-	return Err(Rt.error(ctx, "0A000", Ok("dropping an enum value is not implemented"), l4))
-	Ok(Rt.of_node(result))
+	Err(Rt.error(ctx, "0A000", Ok("dropping an enum value is not implemented"), l4))
 }
 
 ## CreateOpClassStmt: CREATE OPERATOR CLASS any_name opt_default FOR TYPE_P Typename USING name opt_opfamily AS opclass_item_list
@@ -10678,9 +10663,7 @@ rule_1225 = |_ctx, v, _l, _loc, literal_0| {
 rule_1234 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
 rule_1234 = |ctx, _v, l, _loc| {
 	l3 = Rt.location(l, 2)
-	result = Null
-	return Err(Rt.error(ctx, "42601", Ok("missing argument"), l3))
-	Ok(Rt.of_node(result))
+	Err(Rt.error(ctx, "42601", Ok("missing argument"), l3))
 }
 
 ## oper_argtypes: '(' Typename ',' Typename ')'
@@ -13576,9 +13559,7 @@ rule_1778 = |_ctx, v, l, _loc, literal_0, literal_1, literal_2| {
 rule_1779 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
 rule_1779 = |ctx, _v, l, _loc| {
 	l1 = Rt.location(l, 0)
-	result = Null
-	return Err(Rt.error(ctx, "42601", Ok("LIMIT #,# syntax is not supported"), l1))
-	Ok(Rt.of_node(result))
+	Err(Rt.error(ctx, "42601", Ok("LIMIT #,# syntax is not supported"), l1))
 }
 
 ## limit_clause: FETCH first_or_next select_fetch_first_value row_or_rows ONLY
@@ -15622,9 +15603,7 @@ rule_2079 = |_ctx, v, l, _loc, literal_0, literal_1, literal_2| {
 rule_2080 : Rt.Ctx, List(Rt.Value), List(I64), I64 -> Try(Rt.Value, Scan.Problem)
 rule_2080 = |ctx, _v, l, _loc| {
 	l1 = Rt.location(l, 0)
-	result = Null
-	return Err(Rt.error(ctx, "0A000", Ok("UNIQUE predicate is not yet implemented"), l1))
-	Ok(Rt.of_node(result))
+	Err(Rt.error(ctx, "0A000", Ok("UNIQUE predicate is not yet implemented"), l1))
 }
 
 ## a_expr: a_expr IS DOCUMENT_P
@@ -17847,13 +17826,12 @@ def_get_int32 = |def_arg, ctx| {
 	}
 	match Node.tag(Node.def_elem_of(def_arg).arg) {
 		"Integer" => {
-			return Ok(Node.integer_of(Node.def_elem_of(def_arg).arg).ival)
+			Ok(Node.integer_of(Node.def_elem_of(def_arg).arg).ival)
 		}
 		_ => {
-			return Err(Rt.error(ctx, "42601", Ok("${Rt.text_str(Node.def_elem_of(def_arg).defname)} requires an integer value"), (0 - 1)))
+			Err(Rt.error(ctx, "42601", Ok("${Rt.text_str(Node.def_elem_of(def_arg).defname)} requires an integer value"), (0 - 1)))
 		}
 	}
-	Ok(0)
 }
 
 make_range_var_from_any_name : List(Node), I64, Rt.Ctx -> Try(Node, Scan.Problem)
@@ -17895,8 +17873,7 @@ parse_partition_strategy = |strategy_arg, location_arg, ctx| {
 			}
 		}
 	}
-	return Err(Rt.error(ctx, "22023", Ok("unrecognized partitioning strategy \"${Rt.text_str(strategy_arg)}\""), location_arg))
-	Ok(108)
+	Err(Rt.error(ctx, "22023", Ok("unrecognized partitioning strategy \"${Rt.text_str(strategy_arg)}\""), location_arg))
 }
 
 make_float : Node.Text -> Node
@@ -18237,12 +18214,12 @@ make_json_key_value = |key_arg, value_arg| {
 leftmost_loc : I64, I64 -> I64
 leftmost_loc = |loc1_arg, loc2_arg| {
 	if (loc1_arg < 0) {
-		return loc2_arg
+		loc2_arg
 	} else {
 		if (loc2_arg < 0) {
-			return loc1_arg
+			loc1_arg
 		} else {
-			return Rt.min(loc1_arg, loc2_arg)
+			Rt.min(loc1_arg, loc2_arg)
 		}
 	}
 }

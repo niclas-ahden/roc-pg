@@ -900,7 +900,13 @@ independent_value = |e, root|
 stmt : St, CParse.Stmt -> { st : St, lines : Lines }
 stmt = |st, s|
 	match s {
-		Block(items) => {
+		Block(all) => {
+			# Nothing after a statement that leaves can run.
+			items =
+				match all.find_first_index(leaves) {
+					Ok(last) => all.take_first(last + 1)
+					Err(_) => all
+				}
 			saved = st.locals
 			var $st = st
 			var $lines = []
@@ -998,6 +1004,37 @@ stmt = |st, s|
 		Continue => { st: problem(st, "continue"), lines: [] }
 		DoWhile(_, _) => { st: problem(st, "do while"), lines: [] }
 		Switch(subject, cases) => switch(st, subject, cases)
+	}
+
+## Whether control never gets past `s` to the statement after it: every path
+## ends in a `return` or in an error report, which the translation turns into
+## one. roc warns about code after such a statement, so a block stops there.
+## Loops never count, and a `switch` only with a `default` and no case that
+## can `break` out of it.
+leaves : CParse.Stmt -> Bool
+leaves = |s|
+	match s {
+		Return(_) => Bool.True
+		ExprStmt(Call(Ident("ereport"), [Ident("ERROR"), ..])) => Bool.True
+		ExprStmt(Call(Ident("elog"), [Ident("ERROR"), ..])) => Bool.True
+		ExprStmt(Call(Ident("parser_yyerror"), [_])) => Bool.True
+		ExprStmt(Call(Ident("base_yyerror"), [_, _, _])) => Bool.True
+		Block(items) => items.any(leaves)
+		If(_, then, Ok(els)) => leaves(then) and leaves(els)
+		Switch(_, cases) => cases.any(|c| c.is_default) and cases.all(|c| c.body.any(leaves) and !c.body.any(breaks))
+		_ => Bool.False
+	}
+
+## Whether `s` can `break` out of the statement around it. Loops and nested
+## `switch` statements keep their own.
+breaks : CParse.Stmt -> Bool
+breaks = |s|
+	match s {
+		Break => Bool.True
+		Block(items) => items.any(breaks)
+		If(_, then, Ok(els)) => breaks(then) or breaks(els)
+		If(_, then, Err(_)) => breaks(then)
+		_ => Bool.False
 	}
 
 ## The list slot an expression reads, such as `lfirst(cell)` in a loop,
@@ -1495,8 +1532,11 @@ translate_action_body = |env, rule, len, rule_text, body, parameterize| {
 		} else {
 			"var $result = ${zero(result_type)}"
 		}
-	used_locations = location_lines.keep_if(|line| uses_word(Str.join_with(r.lines, "\n"), (line.split_first(" = ").map_ok(|s| s.before) ?? "")))
-	body_lines = value_lines.concat(used_locations).append(result_init).concat(r.lines).append("Ok(Rt.${wrap_fn(result_type)}($result))")
+	# An action that always fails ends in its error, not in its result.
+	tail = if leaves(body) (tail_value(r.lines) ?? r.lines) else r.lines.append("Ok(Rt.${wrap_fn(result_type)}($result))")
+	tail_text = Str.join_with(tail, "\n")
+	used = |lines| lines.keep_if(|line| uses_word(tail_text, (line.split_first(" = ").map_ok(|s| s.before) ?? "").drop_prefix("var ")))
+	body_lines = used(value_lines).concat(used(location_lines)).concat(used([result_init])).concat(tail)
 	body_text = Str.join_with(body_lines, "\n")
 	param = |name| if uses_word(body_text, name) name else "_${name}"
 	params = ["ctx", "v", "l", "loc"].map(param).concat(r.st.literals.map(|literal| param(literal.name)))
@@ -1597,21 +1637,80 @@ translate_function = |env, func, sig| {
 	used_params = all_params.map(|p| if p == "ctx" { if uses_word(body_text, "ctx") p else "_ctx" } else if uses_word(body_text, "\$${p.drop_suffix("_arg")}") p else "_${p}")
 	used_copies = $copies.keep_if(|c| uses_word(body_text, (c.split_first(" = ").map_ok(|s| s.before) ?? "").drop_prefix("var ")))
 	tail =
-		match r.lines.last() {
-			Ok(last) =>
-				if last.starts_with("return ") {
-					r.lines.drop_last(1).append(last.drop_prefix("return "))
-				} else if sig.returns == Void {
+		match tail_value(r.lines) {
+			Ok(lines) => lines
+			Err(_) =>
+				if !leaves(func.body) and (sig.returns == Void or r.lines.is_empty()) {
 					r.lines.append(if sig.fails "Ok({})" else "{}")
 				} else {
 					r.lines
 				}
-			Err(_) => [if sig.fails "Ok({})" else "{}"]
 		}
 	lines = ["${sig.roc} : ${Str.join_with(param_sig, ", ")} -> ${ret}", "${sig.roc} = |${Str.join_with(used_params, ", ")}| {"]
 		.concat(indent(CleanLocals.with_names(used_copies.concat(tail), used_params)))
 		.append("}")
 	{ code: Str.join_with(lines, "\n"), problems: r.st.problems }
+}
+
+## The lines with their final `return` dropped, also through a trailing
+## `if`/`else` or `match` whose every branch ends in one. roc warns about a
+## `return` that is already the function's final expression.
+tail_value : Lines -> Try(Lines, [NotReturning])
+tail_value = |lines| {
+	last = lines.last() ? |_| NotReturning
+	if last.starts_with("return ") {
+		return Ok(lines.drop_last(1).append(last.drop_prefix("return ")))
+	}
+	if last != "}" {
+		return Err(NotReturning)
+	}
+	# The block's own lines are the only unindented ones in it.
+	var $else_at = lines.len()
+	var $if_at = lines.len()
+	var $i = lines.len() - 1
+	while $i > 0 and $if_at == lines.len() {
+		$i = $i - 1
+		line = lines.get($i) ?? ""
+		if !line.starts_with("\t") {
+			if line == "} else {" and $else_at == lines.len() {
+				$else_at = $i
+			} else if line.starts_with("if ") and $else_at < lines.len() {
+				$if_at = $i
+			} else if line.starts_with("match ") and $else_at == lines.len() {
+				return match_tail(lines, $i)
+			} else {
+				return Err(NotReturning)
+			}
+		}
+	}
+	if $if_at == lines.len() {
+		return Err(NotReturning)
+	}
+	unindent = |ls| ls.map(|l| l.drop_prefix("\t"))
+	then_lines = tail_value(unindent(lines.sublist({ start: $if_at + 1, len: $else_at - $if_at - 1 })))?
+	else_lines = tail_value(unindent(lines.sublist({ start: $else_at + 1, len: lines.len() - $else_at - 2 })))?
+	Ok(lines.sublist({ start: 0, len: $if_at + 1 }).concat(indent(then_lines)).append("} else {").concat(indent(else_lines)).append("}"))
+}
+
+## The trailing `match` that starts at `start`, the final `return` of each
+## arm dropped. An arm is `\tpattern => {`, its lines, then `\t}`.
+match_tail : Lines, U64 -> Try(Lines, [NotReturning])
+match_tail = |lines, start| {
+	var $out = lines.take_first(start + 1)
+	var $arm = []
+	for line in lines.sublist({ start: start + 1, len: lines.len() - start - 2 }) {
+		if line.starts_with("\t\t") {
+			$arm = $arm.append(line.drop_prefix("\t\t"))
+		} else if line == "\t}" {
+			$out = $out.concat(indent(indent(tail_value($arm)?))).append(line)
+			$arm = []
+		} else if line.starts_with("\t") and line.ends_with(" => {") {
+			$out = $out.append(line)
+		} else {
+			return Err(NotReturning)
+		}
+	}
+	Ok($out.append("}"))
 }
 
 publish_arg : St, CParse.Expr -> St
