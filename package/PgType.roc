@@ -144,7 +144,7 @@ kind_values = |kind|
 		"U32" => Integers(0, 4294967295)
 		"I64" => Integers(-9223372036854775808, 9223372036854775807)
 		"U64" => Integers(0, 18446744073709551615)
-		"Dec" => Decimals
+		"Dec" | "Numeric" => Decimals
 		"F32" => Floats(32)
 		"F64" => Floats(64)
 		"Bool" => Booleans
@@ -204,3 +204,8 @@ expect !PgType.column_holds("text", PgType.values("text"), "I32")
 expect PgType.column_holds("text", PgType.values("text"), "Str")
 expect PgType.column_holds("integer[]", PgType.values("integer[]"), "List(I16)")
 expect PgType.from_oid(23) == Ok("integer")
+expect PgType.field_holds("Numeric", PgType.values("numeric"), "numeric")
+expect PgType.field_holds("Numeric", PgType.values("bigint"), "bigint")
+expect !PgType.field_holds("Numeric", PgType.values("double precision"), "double precision")
+expect PgType.column_holds("numeric", PgType.values("numeric"), "Numeric")
+expect !PgType.column_holds("integer", PgType.values("integer"), "Numeric")

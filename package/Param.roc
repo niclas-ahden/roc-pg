@@ -15,6 +15,8 @@
 ## server infers each parameter's type from where its `$n` appears: an enum
 ## column takes its label as `Param.str`, an `int[]` column takes
 ## `Param.list(ids.map(Param.i32))`. Only `bytes` goes in binary format.
+import Numeric
+
 Param :: [NullParam, Text(Str), Binary(List(U8)), TextArray(Str)].{
 
 	null : Param
@@ -60,6 +62,9 @@ Param :: [NullParam, Text(Str), Binary(List(U8)), TextArray(Str)].{
 
 	f64 : F64 -> Param
 	f64 = |value| Text(value.to_str())
+
+	numeric : Numeric -> Param
+	numeric = |value| Text(value.to_str())
 
 	dec : Dec -> Param
 	dec = |value| Text(value.to_str())

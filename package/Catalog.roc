@@ -286,3 +286,8 @@ expect checked("select coalesce((array[id])[1], 0) as x from students", [], [fie
 expect in_domains("select (array[small])[1]::present as p from pixels", [], [field("p", "I32", Bool.False)]) == Ok({})
 expect in_domains("select (array[small])[1]::integer as p from pixels", [], [field("p", "I32", Bool.False)]) == Err("column `p` may be NULL as far as the query shows, so its field needs to be `Try(I32, [Null])`, or the query must show it is not, see \"Telling the checker more\" in the README")
 expect in_domains("select (array[small])[1]::u8 as p from pixels", [], [field("p", "U8", Bool.True)]) == Ok({})
+
+# A parameter is NULL only when its field takes NULL.
+expect typed("select $n::integer + 1 as m, $o::integer as p from students", [field("n", "I32", Bool.False), field("o", "I32", Bool.True)]).map_ok(|_| {}) == Ok({})
+expect Catalog.check(test_catalog, "select $n::integer + 1 as m from students", [field("n", "I32", Bool.False)], [field("m", "I32", Bool.False)]).map_ok(|_| {}) == Ok({})
+expect Catalog.check(test_catalog, "select $n::integer as m from students", [field("n", "I32", Bool.True)], [field("m", "I32", Bool.False)]) == Err("column `m` can be NULL, so its field needs to be `Try(I32, [Null])`")

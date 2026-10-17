@@ -1012,7 +1012,15 @@ walk = |node, rels, env| {
 				}
 				Err(_) => leaf(unknown_output)
 			}
-		ParamRef(_) => { ..leaf(unknown_output), arg: Untyped }
+		# A parameter is NULL only when its field is a `Try(_, [Null])`.
+		ParamRef(p) => {
+			nullable =
+				match param_name(p, env).map_ok(|name| env.params.find_first(|q| q.name == name)) {
+					Ok(Ok(param)) => if param.nullable Yes else No
+					_ => Unknown
+				}
+			{ ..leaf({ ..unknown_output, nullable }), arg: Untyped }
+		}
 		AConst(c) =>
 			if c.isnull {
 				{ ..leaf({ ..unknown_output, nullable: Yes }), arg: Untyped }

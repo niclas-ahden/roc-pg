@@ -6,6 +6,7 @@
 ## for `Err(Null)`, and a `List(T)` becomes a Postgres array. A record inside
 ## the record is not a parameter.
 import Param
+import Numeric
 
 ParamFormat := [Text].{
 	rename_field : ParamFormat, Str -> Str
@@ -95,6 +96,10 @@ ParamFormat := [Text].{
 
 	encode_f64 : F64, ParamFormat.State -> Try(ParamFormat.State, ParamFormat.Err)
 	encode_f64 = |value, state| add(state, Param.f64(value))
+
+	## A [Numeric] parameter, which no format of Roc's own writes.
+	encode_numeric : ParamFormat, Numeric, ParamFormat.State -> Try(ParamFormat.State, ParamFormat.Err)
+	encode_numeric = |_, value, state| add(state, Param.numeric(value))
 }
 
 ## Inside a list the value is an element, otherwise it is the parameter of

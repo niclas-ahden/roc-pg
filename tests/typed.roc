@@ -16,6 +16,7 @@ import pf.Random
 import pf.OsStr
 import pg.Client
 import pg.Catalog
+import pg.Numeric
 
 ## The schema the queries below are checked against. An app imports its
 ## `schema.sql` instead of writing it inline.
@@ -185,6 +186,14 @@ test_runtime_checks! = |db| {
 			_ => Bool.False
 		},
 	)?
+
+	# A Numeric keeps every digit the server gives, and goes back exact.
+	exact : List({ x : Numeric })
+	exact = db.query!("select $third::numeric / 3 as x", { third: Numeric.from_i128(1) })?
+	check("a numeric division into a Numeric", exact.map(|r| r.x.to_str()) == ["0.33333333333333333333"])?
+	back : List({ same : Bool })
+	back = db.query!("select $x = 0.33333333333333333333 as same", { x: (exact.first() ?? { x: Numeric.from_i128(0) }).x })?
+	check("a Numeric parameter", back == [{ same: Bool.True }])?
 
 	# numeric division gives 20 places here, a Dec keeps 18.
 	third : List({ x : Dec })

@@ -12,6 +12,8 @@
 ##
 ## `client.query_unchecked!` and the other query functions run and decode
 ## in one call.
+import Numeric
+
 PgResult :: {
 	columns : List(Str),
 	raw_rows : List(List([Null, Present(List(U8))])),
@@ -132,6 +134,11 @@ PgResult :: {
 		dec : Row, Str -> Try(Dec, [FieldNotFound(Str), UnexpectedNull(Str), BadUtf8(Str), InvalidNumStr(Str)])
 		dec = |row, name| dec_text(Row.str(row, name)?).map_err(|_| InvalidNumStr(name))
 
+		## An exact [Numeric], for a `numeric` value with more digits than a
+		## [Dec] holds.
+		numeric : Row, Str -> Try(Numeric, [FieldNotFound(Str), UnexpectedNull(Str), BadUtf8(Str), InvalidNumStr(Str)])
+		numeric = |row, name| Numeric.from_str(Row.str(row, name)?).map_err(|_| InvalidNumStr(name))
+
 		u8_nullable : Row, Str -> Try([Null, Present(U8)], [FieldNotFound(Str), BadUtf8(Str), InvalidNumStr(Str)])
 		u8_nullable = |row, name|
 			match Row.str_nullable(row, name)? {
@@ -207,6 +214,13 @@ PgResult :: {
 			match Row.str_nullable(row, name)? {
 				Null => Ok(Null)
 				Present(text) => dec_text(text).map_ok(|v| Present(v)).map_err(|_| InvalidNumStr(name))
+			}
+
+		numeric_nullable : Row, Str -> Try([Null, Present(Numeric)], [FieldNotFound(Str), BadUtf8(Str), InvalidNumStr(Str)])
+		numeric_nullable = |row, name|
+			match Row.str_nullable(row, name)? {
+				Null => Ok(Null)
+				Present(text) => Numeric.from_str(text).map_ok(|v| Present(v)).map_err(|_| InvalidNumStr(name))
 			}
 
 		## The column value as a bool (postgres text format), or `Null`.

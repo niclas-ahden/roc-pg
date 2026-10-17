@@ -15,6 +15,7 @@
 ## type. One format serves both, so a query needs one `parser_for` of its
 ## row type, not two.
 import PgResult
+import Numeric
 
 RowFormat := [Text, Nulls, Kinds].{
 	## One field of a record type. `kind` is `Str`, `I32`, `Bool`, `Dec`,
@@ -205,6 +206,10 @@ RowFormat := [Text, Nulls, Kinds].{
 	parse_dec : RowFormat, RowFormat.State -> Try({ value : Dec, rest : RowFormat.State }, [PgDecodeErr(Str)])
 	parse_dec = |format, state| number(format, state, "Dec", "a Dec", PgResult.dec_from_text, 0)
 
+	## A [Numeric] field, which no format of Roc's own reads.
+	parse_numeric : RowFormat, RowFormat.State -> Try({ value : Numeric, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_numeric = |format, state| number(format, state, "Numeric", "a Numeric", Numeric.from_str, Numeric.from_i128(0))
+
 	parse_f32 : RowFormat, RowFormat.State -> Try({ value : F32, rest : RowFormat.State }, [PgDecodeErr(Str)])
 	parse_f32 = |format, state| number(format, state, "F32", "an F32", F32.from_str, 0)
 
@@ -345,4 +350,19 @@ expect {
 expect {
 	Nested : { id : I32, inner : { x : I32 } }
 	RowFormat.shape(Nested.parser_for(RowFormat.Nulls), Nested.parser_for(RowFormat.Kinds)) == Err(NestedRecord)
+}
+
+expect {
+	Row : { total : Numeric, parts : List(Numeric) }
+	row : Try(Row, _)
+	row = RowFormat.decode(["total", "parts"], [present("1.2345678901234567890123"), present("{1.5,-2}")], Row.parser_for(RowFormat.Text))
+	match row {
+		Ok(r) => r.total.to_str() == "1.2345678901234567890123" and r.parts.map(|p| p.to_str()) == ["1.5", "-2"]
+		Err(_) => Bool.False
+	}
+}
+
+expect {
+	Row : { total : Numeric, maybe : Try(Numeric, [Null]) }
+	RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) == Ok([{ name: "maybe", kind: "Numeric", nullable: Bool.True }, { name: "total", kind: "Numeric", nullable: Bool.False }])
 }
