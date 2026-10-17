@@ -8,6 +8,7 @@
 ## and unknown things are not checked. Only what it is sure of becomes a
 ## problem.
 import Catalog
+import Enums
 import Overload
 import Lex
 import Node
@@ -249,7 +250,7 @@ select_stmt : Node.SelectStmt, Env -> Check.Result
 select_stmt = |s, env| {
 	{ env: inner, problems: with_problems } = with_env(s.with_clause, env)
 	result =
-		if s.op != 0 {
+		if s.op != Enums.setop_none {
 			set_operation(s, inner)
 		} else if !s.values_lists.is_empty() {
 			values_select(s.values_lists, inner)
@@ -279,7 +280,7 @@ set_operation = |s, env| {
 
 set_branches : Node.SelectStmt -> List(Node.SelectStmt)
 set_branches = |s|
-	if s.op == 0 {
+	if s.op == Enums.setop_none {
 		[s]
 	} else {
 		branch_list(s.larg).concat(branch_list(s.rarg))
@@ -655,11 +656,14 @@ join = |j, env| {
 	# A merged column is the right side's in a right join, the left side's
 	# otherwise.
 	rels =
-		match j.jointype {
-			1 => left.rels.concat(nulled(hide(right.rels)))
-			2 => nulled(left.rels).concat(nulled(hide(right.rels)))
-			3 => nulled(hide(left.rels)).concat(right.rels)
-			_ => left.rels.concat(hide(right.rels))
+		if j.jointype == Enums.join_left {
+			left.rels.concat(nulled(hide(right.rels)))
+		} else if j.jointype == Enums.join_full {
+			nulled(left.rels).concat(nulled(hide(right.rels)))
+		} else if j.jointype == Enums.join_right {
+			nulled(hide(left.rels)).concat(right.rels)
+		} else {
+			left.rels.concat(hide(right.rels))
 		}
 	problems = left.problems.concat(right.problems).concat(expression_problems(j.quals, rels, env))
 	{ rels, problems }
@@ -796,12 +800,12 @@ not_null_refs = |node| {
 				},
 		)
 	match node {
-		BoolExpr(b) if b.boolop == 0 => b.args.fold([], |acc, arg| acc.concat(not_null_refs(arg)))
-		NullTest(t) if t.nulltesttype == 1 => direct([t.arg])
+		BoolExpr(b) if b.boolop == Enums.and_expr => b.args.fold([], |acc, arg| acc.concat(not_null_refs(arg)))
+		NullTest(t) if t.nulltesttype == Enums.is_not_null => direct([t.arg])
 		AExpr(a) =>
-			if a.kind == 0 and comparison_ops.contains(op_name(a)) {
+			if a.kind == Enums.aexpr_op and comparison_ops.contains(op_name(a)) {
 				direct([a.lexpr, a.rexpr])
-			} else if [1, 2, 6, 7, 8, 9].contains(a.kind) {
+			} else if [Enums.aexpr_op_any, Enums.aexpr_op_all, Enums.aexpr_in, Enums.aexpr_like, Enums.aexpr_ilike, Enums.aexpr_similar].contains(a.kind) {
 				direct([a.lexpr])
 			} else if a.kind >= 10 and a.kind <= 13 {
 				direct([a.lexpr])
@@ -873,7 +877,7 @@ expr_output = |node, rels, env| {
 		}
 		MinMaxExpr(m) => {
 			args = m.args.map(|arg| expr_output(arg, rels, env))
-			{ name: if m.op == 0 "greatest" else "least", type: common_type(args), nullable: first_non_null(args) }
+			{ name: if m.op == Enums.is_greatest "greatest" else "least", type: common_type(args), nullable: first_non_null(args) }
 		}
 		CaseExpr(c) => {
 			results = c.args.keep_oks(
@@ -959,14 +963,14 @@ aexpr_output : Node.AExpr, List(Rel), Env -> Check.Output
 aexpr_output = |a, rels, env| {
 	unknown = { name: "?column?", type: Unknown, nullable: Unknown }
 	operands = operand_outputs(a, rels, env)
-	if a.kind == 5 {
+	if a.kind == Enums.aexpr_nullif {
 		# nullif(a, b)
 		left = expr_output(a.lexpr, rels, env)
 		{ name: "nullif", type: left.type, nullable: Yes }
-	} else if a.kind == 3 or a.kind == 4 {
+	} else if a.kind == Enums.aexpr_distinct or a.kind == Enums.aexpr_not_distinct {
 		# is [not] distinct from
 		{ ..unknown, type: Known("boolean"), nullable: No }
-	} else if a.kind != 0 or comparison_ops.contains(op_name(a)) {
+	} else if a.kind != Enums.aexpr_op or comparison_ops.contains(op_name(a)) {
 		# Comparisons, any/all, in, like, similar and between.
 		{ ..unknown, type: Known("boolean"), nullable: all_not_null(operands) }
 	} else {
@@ -1155,43 +1159,52 @@ sublink_output = |s, rels, env| {
 			_ => { name: "?column?", type: Unknown, nullable: Unknown }
 		}
 	}
-	match s.sub_link_type {
-		0 => { name: "exists", type: Known("boolean"), nullable: No }
-		4 => {
-			# A scalar subquery is NULL when it finds no row.
-			{ ..first(), nullable: Yes }
-		}
-		6 => {
-			element = first()
-			type =
-				match element.type {
-					Known(t) => Known("${t}[]")
-					Unknown => Unknown
-				}
-			{ name: "array", type, nullable: No }
-		}
-		_ => { name: "?column?", type: Known("boolean"), nullable: Unknown }
+	if s.sub_link_type == Enums.exists_sublink {
+		{ name: "exists", type: Known("boolean"), nullable: No }
+	} else if s.sub_link_type == Enums.expr_sublink {
+		# A scalar subquery is NULL when it finds no row.
+		{ ..first(), nullable: Yes }
+	} else if s.sub_link_type == Enums.array_sublink {
+		element = first()
+		type =
+			match element.type {
+				Known(t) => Known("${t}[]")
+				Unknown => Unknown
+			}
+		{ name: "array", type, nullable: No }
+	} else {
+		{ name: "?column?", type: Known("boolean"), nullable: Unknown }
 	}
 }
 
 sql_value_output : Node.SQLValueFunction -> Check.Output
 sql_value_output = |v| {
 	{ name, type } =
-		match v.op {
-			0 => { name: "current_date", type: "date" }
-			1 | 2 => { name: "current_time", type: "time with time zone" }
-			3 | 4 => { name: "current_timestamp", type: "timestamp with time zone" }
-			5 | 6 => { name: "localtime", type: "time without time zone" }
-			7 | 8 => { name: "localtimestamp", type: "timestamp without time zone" }
-			9 => { name: "current_role", type: "name" }
-			10 => { name: "current_user", type: "name" }
-			11 => { name: "user", type: "name" }
-			12 => { name: "session_user", type: "name" }
-			13 => { name: "current_catalog", type: "name" }
-			_ => { name: "current_schema", type: "name" }
+		if v.op == Enums.svfop_current_date {
+			{ name: "current_date", type: "date" }
+		} else if v.op == Enums.svfop_current_time or v.op == Enums.svfop_current_time_n {
+			{ name: "current_time", type: "time with time zone" }
+		} else if v.op == Enums.svfop_current_timestamp or v.op == Enums.svfop_current_timestamp_n {
+			{ name: "current_timestamp", type: "timestamp with time zone" }
+		} else if v.op == Enums.svfop_localtime or v.op == Enums.svfop_localtime_n {
+			{ name: "localtime", type: "time without time zone" }
+		} else if v.op == Enums.svfop_localtimestamp or v.op == Enums.svfop_localtimestamp_n {
+			{ name: "localtimestamp", type: "timestamp without time zone" }
+		} else if v.op == Enums.svfop_current_role {
+			{ name: "current_role", type: "name" }
+		} else if v.op == Enums.svfop_current_user {
+			{ name: "current_user", type: "name" }
+		} else if v.op == Enums.svfop_user {
+			{ name: "user", type: "name" }
+		} else if v.op == Enums.svfop_session_user {
+			{ name: "session_user", type: "name" }
+		} else if v.op == Enums.svfop_current_catalog {
+			{ name: "current_catalog", type: "name" }
+		} else {
+			{ name: "current_schema", type: "name" }
 		}
 	# current_schema is NULL when the search path names no schema that exists.
-	{ name, type: Known(type), nullable: if v.op == 14 Unknown else No }
+	{ name, type: Known(type), nullable: if v.op == Enums.svfop_current_schema Unknown else No }
 }
 
 ## The type a `TypeName` names, spelled like [Catalog] spells column types.
@@ -1371,7 +1384,7 @@ function_call_problems = |f, rels, env|
 ## `text_col = int_col`.
 operator_call_problems : Node.AExpr, List(Rel), Env -> List(Str)
 operator_call_problems = |a, rels, env|
-	if !refuses_calls(env) or a.kind != 0 {
+	if !refuses_calls(env) or a.kind != Enums.aexpr_op {
 		[]
 	} else {
 		match operator_choice(a, rels, env) {
@@ -1405,7 +1418,7 @@ param_type_problems = |p, type, what, env|
 ## comparison with a column, which [comparison_problems] reads.
 operator_param_problems : Node.AExpr, List(Rel), Env -> List(Str)
 operator_param_problems = |a, rels, env|
-	if env.params.is_empty() or a.kind != 0 {
+	if env.params.is_empty() or a.kind != Enums.aexpr_op {
 		[]
 	} else if comparison_ops.contains(op_name(a)) {
 		# A parameter compared with an expression of a known type.
@@ -1468,18 +1481,18 @@ comparison_problems : Node.AExpr, List(Rel), Env -> List(Str)
 comparison_problems = |a, rels, env|
 	if env.params.is_empty() {
 		[]
-	} else if a.kind == 0 and comparison_ops.contains(op_name(a)) {
+	} else if a.kind == Enums.aexpr_op and comparison_ops.contains(op_name(a)) {
 		match (a.lexpr, a.rexpr) {
 			(ColumnRef(c), ParamRef(p)) => column_param_problems(c, p, Scalar, rels, env)
 			(ParamRef(p), ColumnRef(c)) => column_param_problems(c, p, Scalar, rels, env)
 			_ => []
 		}
-	} else if a.kind == 1 or a.kind == 2 {
+	} else if a.kind == Enums.aexpr_op_any or a.kind == Enums.aexpr_op_all {
 		match (a.lexpr, a.rexpr) {
 			(ColumnRef(c), ParamRef(p)) => column_param_problems(c, p, Array, rels, env)
 			_ => []
 		}
-	} else if a.kind == 6 or (a.kind >= 10 and a.kind <= 13) {
+	} else if a.kind == Enums.aexpr_in or (a.kind >= Enums.aexpr_between and a.kind <= Enums.aexpr_not_between_sym) {
 		match (a.lexpr, a.rexpr) {
 			(ColumnRef(c), NodeList(items)) =>
 				items.fold(
@@ -1667,7 +1680,7 @@ insert_shape_problems = |source, listed, target, env| {
 	columns = if listed.is_empty() table_columns_list.map(|c| c.name) else listed
 	{ widths, value_problems: stored } =
 		match source {
-			SelectStmt(sel) if sel.op == 0 and !sel.values_lists.is_empty() => {
+			SelectStmt(sel) if sel.op == Enums.setop_none and !sel.values_lists.is_empty() => {
 				rows = sel.values_lists.map(
 					|row|
 						match row {
@@ -1824,7 +1837,7 @@ insert_stmt = |s, env| {
 	shape_problems = insert_shape_problems(s.select_stmt, listed, target, inner)
 	source_problems =
 		match s.select_stmt {
-			SelectStmt(sel) if sel.op == 0 and !sel.values_lists.is_empty() =>
+			SelectStmt(sel) if sel.op == Enums.setop_none and !sel.values_lists.is_empty() =>
 				values_problems(sel.values_lists, listed, target, inner).concat(values_select(sel.values_lists, inner).problems)
 			Null => []
 			other => statement(other, inner).problems

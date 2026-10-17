@@ -176,7 +176,8 @@ main! = |_args| {
 
 	header = license(copyright)
 	node_roc = node_module(header, types, structs)
-	json = TreeJson.source(header, read!("tools/node_json_hand.roc")?, types, structs, Consts.enum_types($headers, consts))
+	enums = Consts.enum_types($headers, consts)
+	json = TreeJson.source(header, read!("tools/node_json_hand.roc")?, types, structs, enums)
 	actions_roc = Str.join_with(
 		[
 			header,
@@ -204,6 +205,7 @@ main! = |_args| {
 	)
 	Path.write_utf8!(Path.utf8("package/Node.roc"), node_roc)?
 	Path.write_utf8!(Path.utf8("package/Actions.roc"), actions_roc)?
+	Path.write_utf8!(Path.utf8("package/Enums.roc"), enums_module(header, types, structs, enums))?
 	Path.write_utf8!(Path.utf8("tests/NodeJson.roc"), json.code)?
 	for u in json.unknown {
 		Stdout.line!("  JSON: field type not written: ${u}")?
@@ -339,6 +341,42 @@ license = |copyright| {
 	lines : List(Str)
 	lines = copyright.trim_end().split_on("\n").map(|line| if line.is_empty() "#" else "# ${line}")
 	"# Derived from PostgreSQL 18.6, src/backend/parser/gram.y and the node\n# headers and functions it uses.\n#\n${Str.join_with(lines, "\n")}\n"
+}
+
+## `package/Enums.roc`: a named constant for each value of the enums that
+## node fields have, such as `Enums.object_table` for `OBJECT_TABLE`.
+enums_module : Str, List(Str), Dict(Str, List(Structs.Field)), Dict(Str, List((Str, I64))) -> Str
+enums_module = |header, types, structs, enums| {
+	used = types.fold(
+		[],
+		|acc, t|
+			(structs.get(t) ?? []).fold(
+				acc,
+				|a, f| {
+					base = f.type.replace_each("const ", "").replace_each("enum ", "").trim()
+					if enums.contains(base) and !a.contains(base) a.append(base) else a
+				},
+			),
+	)
+	blocks = used.sort_with(compare_str).map(
+		|e| {
+			constants = (enums.get(e) ?? []).map(|(name, value)| "\t${Translate.snake(name)} : I64\n\t${Translate.snake(name)} = ${value.to_str()}\n")
+			"\t# `${e}`\n\n${Str.join_with(constants, "\n")}"
+		},
+	)
+	Str.join_with(
+		[
+			header,
+			"## The values of the C enums that fields of the parse tree hold, by their",
+			"## C names in snake case: `Enums.object_table` is `OBJECT_TABLE`. Written",
+			"## by `tools/actions.roc`, do not edit.",
+			"Enums :: [].{",
+			Str.join_with(blocks, "\n"),
+			"}",
+			"",
+		],
+		"\n",
+	)
 }
 
 ## `package/Node.roc`: one tag and record per node type.

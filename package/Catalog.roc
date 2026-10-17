@@ -27,6 +27,7 @@
 ## Postgres's own grammar. Everything else in the dump (indexes, sequences,
 ## grants, comments) is skipped. A statement it reads that the grammar
 ## refuses stops the build, as the dump is then not what `pg_dump` wrote.
+import Enums
 import Lex
 import Node
 import Parse
@@ -122,7 +123,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 								{ name, schema } = relation_name(v.view)
 								$tables = $tables.append({ name, schema, columns: View({ query: v.query, aliases: names_of(v.aliases) }), primary_key: [], triggers: Bool.False })
 							}
-							CreateTableAsStmt(c) if c.objtype == 23 =>
+							CreateTableAsStmt(c) if c.objtype == Enums.object_matview =>
 								match c.into {
 									IntoClause(into) => {
 										{ name, schema } = relation_name(into.rel)
@@ -138,7 +139,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 								$enums = $enums.append({ name: names_of(e.type_name).last() ?? "", labels: names_of(e.vals) })
 							}
 							CreateDomainStmt(d) => {
-								not_null = d.constraints.any(|c| constraint_type(c) == 1)
+								not_null = d.constraints.any(|c| constraint_type(c) == Enums.constr_notnull)
 								$domains = $domains.append({ name: names_of(d.domainname).last() ?? "", base: Catalog.type_name(d.type_name), not_null })
 							}
 							CreateFunctionStmt(f) if !f.is_procedure => {
@@ -277,8 +278,8 @@ create_table : Node.CreateStmt -> Catalog.Table
 create_table = |s| {
 	{ name, schema } = relation_name(s.relation)
 	constraints = s.table_elts.concat(s.constraints).concat(s.nnconstraints)
-	primary_key = constraints.fold([], |acc, c| if constraint_type(c) == 6 acc.concat(constraint_keys(c)) else acc)
-	not_null = constraints.fold([], |acc, c| if constraint_type(c) == 1 acc.concat(constraint_keys(c)) else acc)
+	primary_key = constraints.fold([], |acc, c| if constraint_type(c) == Enums.constr_primary acc.concat(constraint_keys(c)) else acc)
+	not_null = constraints.fold([], |acc, c| if constraint_type(c) == Enums.constr_notnull acc.concat(constraint_keys(c)) else acc)
 	defined = s.table_elts.keep_oks(
 		|elt|
 			match elt {
@@ -306,9 +307,9 @@ create_table = |s| {
 
 column : Node.ColumnDef -> Catalog.Column
 column = |c| {
-	not_null = c.is_not_null or c.constraints.any(|con| constraint_type(con) == 1 or constraint_type(con) == 6)
+	not_null = c.is_not_null or c.constraints.any(|con| constraint_type(con) == Enums.constr_notnull or constraint_type(con) == Enums.constr_primary)
 	# A default, an identity or a generated column.
-	has_default = c.raw_default != Null or c.identity != 0 or c.generated != 0 or c.constraints.any(|con| [2, 3, 4].contains(constraint_type(con)))
+	has_default = c.raw_default != Null or c.identity != 0 or c.generated != 0 or c.constraints.any(|con| [Enums.constr_default, Enums.constr_identity, Enums.constr_generated].contains(constraint_type(con)))
 	{ name: c.colname ?? "", type: Catalog.type_name(c.type_name), not_null, has_default }
 }
 
@@ -336,14 +337,14 @@ alter_table = |table, cmds|
 		|t, cmd|
 			match cmd {
 				AlterTableCmd(c) =>
-					if c.subtype == 16 and constraint_type(c.def) == 6 {
+					if c.subtype == Enums.at_add_constraint and constraint_type(c.def) == Enums.constr_primary {
 						keys = constraint_keys(c.def)
 						{ ..set_not_null(t, keys), primary_key: t.primary_key.concat(keys) }
-					} else if c.subtype == 5 {
+					} else if c.subtype == Enums.at_set_not_null {
 						set_not_null(t, [c.name ?? ""])
-					} else if (c.subtype == 2 and c.def != Null) or c.subtype == 62 {
+					} else if (c.subtype == Enums.at_column_default and c.def != Null) or c.subtype == Enums.at_add_identity {
 						set_has_default(t, c.name ?? "")
-					} else if c.subtype == 0 {
+					} else if c.subtype == Enums.at_add_column {
 						match (t.columns, c.def) {
 							(Known(columns), ColumnDef(def)) => { ..t, columns: Known(columns.append(column(def))) }
 							_ => t
@@ -380,8 +381,8 @@ create_function = |f| {
 	)
 	# IN, INOUT, VARIADIC and the default mode take an argument. OUT, INOUT
 	# and TABLE give a column.
-	inputs = params.keep_if(|p| [105, 98, 118, 100].contains(p.mode))
-	outputs = params.keep_if(|p| [111, 98, 116].contains(p.mode)).map(|p| { name: p.name ?? "", type: Catalog.type_name(p.arg_type) })
+	inputs = params.keep_if(|p| [Enums.func_param_in, Enums.func_param_inout, Enums.func_param_variadic, Enums.func_param_default].contains(p.mode))
+	outputs = params.keep_if(|p| [Enums.func_param_out, Enums.func_param_inout, Enums.func_param_table].contains(p.mode)).map(|p| { name: p.name ?? "", type: Catalog.type_name(p.arg_type) })
 	declared = Catalog.type_name(f.return_type)
 	result =
 		match outputs {
@@ -413,7 +414,7 @@ create_function = |f| {
 		name: names_of(f.funcname).last() ?? "",
 		args: inputs.map(|p| Catalog.type_name(p.arg_type)),
 		defaults: inputs.count_if(|p| p.defexpr != Null),
-		variadic: inputs.any(|p| p.mode == 118),
+		variadic: inputs.any(|p| p.mode == Enums.func_param_variadic),
 		result,
 		set,
 		strict,

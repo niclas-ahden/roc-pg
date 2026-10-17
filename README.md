@@ -144,7 +144,7 @@ That is about 0.4 seconds for each field of each distinct row type, whether or n
 - `Catalog.roc` reads `schema.sql`, with the same parser.
 - `Check.roc` walks the tree against the catalog: tables, columns, parameters, row fields, NULL. `Overload.roc` picks functions and operators by argument types, using the built in types and functions in `Builtins.roc`.
 
-`Grammar.roc`, `Node.roc`, `Actions.roc`, `Keywords.roc` and `Builtins.roc` are generated from Postgres's sources by the programs in `tools/`.
+`Grammar.roc`, `Node.roc`, `Enums.roc`, `Actions.roc`, `Keywords.roc` and `Builtins.roc` are generated from Postgres's sources by the programs in `tools/`.
 
 When changing or regenerating code, follow the
 [code-generation guidelines](docs/code-generation-guidelines.md). They explain
