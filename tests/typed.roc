@@ -32,6 +32,9 @@ schema_sql =
 	\\CREATE TABLE public.typed_badges (
 	\\    person_id integer NOT NULL
 	\\);
+	\\
+	\\CREATE DOMAIN public.typed_u8 AS smallint CHECK (VALUE BETWEEN 0 AND 255);
+	\\CREATE TABLE public.typed_pixels (red public.typed_u8 NOT NULL);
 
 catalog : Catalog
 catalog = Catalog.from_schema(schema_sql)
@@ -65,6 +68,10 @@ main! = |args| {
 	# before the app was rebuilt.
 	_ = client.execute_unchecked!("drop table if exists typed_badges", [])?
 	_ = client.execute_unchecked!("create table typed_badges (person_id integer not null, name text not null)", [])?
+	_ = client.execute_unchecked!("drop table if exists typed_pixels", [])?
+	_ = client.execute_unchecked!("drop domain if exists typed_u8", [])?
+	_ = client.execute_unchecked!("create domain typed_u8 as smallint check (value between 0 and 255)", [])?
+	_ = client.execute_unchecked!("create table typed_pixels (red typed_u8 not null)", [])?
 
 	test_insert_and_select!(client)?
 	test_one_and_optional!(client)?
@@ -168,6 +175,13 @@ test_runtime_checks! = |db| {
 			_ => Bool.False
 		},
 	)?
+	# The server reports a domain's column as its base type, smallint here,
+	# which the build already saw fits the U8.
+	_ = db.execute!("insert into typed_pixels (red) values ($red)", { red: 200.U8 })?
+	reds : List({ red : U8 })
+	reds = db.query!("select red from typed_pixels", {})?
+	check("a bounded domain into a narrower field", reds == [{ red: 200 }])?
+
 	# numeric division gives 20 places here, a Dec keeps 18.
 	third : List({ x : Dec })
 	third = db.query!("select 1::numeric / 3 as x", {})?

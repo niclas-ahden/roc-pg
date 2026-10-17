@@ -28,11 +28,12 @@
 ## grants, comments) is skipped. A statement it reads that the grammar
 ## refuses stops the build, as the dump is then not what `pg_dump` wrote.
 import Enums
+import PgType
 import Lex
 import Node
 import Parse
 
-Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions : List(Catalog.Function), extensions : List(Str), none : Bool, search_path : List(Str) }.{
+Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), domains : List(Catalog.Domain), functions : List(Catalog.Function), extensions : List(Str), none : Bool, search_path : List(Str) }.{
 	## A table or a view. A view's columns are the ones its query returns,
 	## which the analysis works out when a query reads it. `primary_key` is
 	## empty for a table without one. `triggers` is whether a trigger is
@@ -49,6 +50,13 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 
 	Enum : { name : Str, schema : Str, labels : List(Str) }
 
+	## A domain whose `check` constraints bound its integers, as
+	## `create domain u8 as smallint check (value between 0 and 255)` does.
+	## A column of it has the domain's name for its type, so that a field
+	## of a narrower Roc type, a `U8` here, takes it. A column of any other
+	## domain has the domain's base type.
+	Domain : { name : Str, schema : Str, base : Str, low : I128, high : I128 }
+
 	## A function of the schema. `args` are the types it takes, the last
 	## `defaults` of which may be left out. A function with several `OUT`
 	## parameters or `returns table` returns `record`, and `outputs` are its
@@ -59,7 +67,7 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 	## and parameters, but any table, column or function goes. A dump without
 	## tables is not this: its queries can name no table.
 	none : Catalog
-	none = Catalog.{ tables: [], enums: [], functions: [], extensions: [], none: Bool.True, search_path: default_search_path }
+	none = Catalog.{ tables: [], enums: [], domains: [], functions: [], extensions: [], none: Bool.True, search_path: default_search_path }
 
 	## The schemas a name without one is looked for in, in order, as the
 	## server's `search_path` setting lists them. `["public"]` unless set
@@ -93,6 +101,10 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 			Ok(e) => Ok(e.labels)
 			Err(_) => Err(NotFound)
 		}
+
+	## The domain `name` that bounds its integers, found on the search path.
+	domain : Catalog, Str -> Try(Catalog.Domain, [NotFound])
+	domain = |catalog, name| in_path(catalog, catalog.domains, |d| d.name == name, |d| d.schema)
 
 	functions : Catalog -> List(Catalog.Function)
 	functions = |catalog| catalog.functions
@@ -182,7 +194,8 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 								{ name, schema } = qualified_name(d.domainname)
 								not_null = d.constraints.any(|c| constraint_type(c) == Enums.constr_notnull)
 								has_default = d.constraints.any(|c| constraint_type(c) == Enums.constr_default)
-								$domains = $domains.append({ name, schema, base: Catalog.type_name(d.type_name), not_null, has_default })
+								base = Catalog.type_name(d.type_name)
+								$domains = $domains.append({ name, schema, base, not_null, has_default, bounds: domain_bounds(base, d.constraints) })
 							}
 							CreateFunctionStmt(f) if !f.is_procedure => {
 								$functions = $functions.append(create_function(f))
@@ -215,7 +228,14 @@ Catalog :: { tables : List(Catalog.Table), enums : List(Catalog.Enum), functions
 					_ => t
 				},
 		)
-		Ok(Catalog.{ tables: resolved, enums: $enums, functions: $functions, extensions: $extensions, none: Bool.False, search_path: default_search_path })
+		bounded = domains.keep_oks(
+			|d|
+				match d.bounds {
+					Bounded(low, high) => Ok({ name: d.name, schema: d.schema, base: d.base, low, high })
+					Unbounded => Err(Unbounded)
+				},
+		)
+		Ok(Catalog.{ tables: resolved, enums: $enums, domains: bounded, functions: $functions, extensions: $extensions, none: Bool.False, search_path: default_search_path })
 	}
 
 	## The type a `TypeName` node names, spelled as `pg_dump` spells column
@@ -285,12 +305,102 @@ canonical_type = |name|
 		_ => name
 	}
 
-Domain : { name : Str, schema : Str, base : Str, not_null : Bool, has_default : Bool }
+## The integers a domain over an integer type holds, when its `check`
+## constraints bound them: `value between 0 and 255`, or as `pg_dump`
+## writes that, `((value >= 0) and (value <= 255))`. Checks of any other
+## shape leave the bounds as they are, and the base type's range bounds
+## them anyway.
+domain_bounds : Str, List(Node) -> [Bounded(I128, I128), Unbounded]
+domain_bounds = |base, constraints|
+	match PgType.values(base) {
+		Integers(min, max) => {
+			checks = constraints.keep_oks(
+				|c|
+					match c {
+						Constraint(con) if con.contype == Enums.constr_check => Ok(con.raw_expr)
+						_ => Err(NotACheck)
+					},
+			)
+			{ low, high } = checks.fold({ low: min, high: max }, |acc, check| narrow(acc, check))
+			if low == min and high == max Unbounded else Bounded(low, high)
+		}
+		_ => Unbounded
+	}
 
-resolve_domain : Catalog.Column, List(Domain) -> Catalog.Column
+## `range` narrowed by what `check` requires of `value`.
+narrow : { low : I128, high : I128 }, Node -> { low : I128, high : I128 }
+narrow = |range, check| {
+	at_least = |n| { ..range, low: if n > range.low n else range.low }
+	at_most = |n| { ..range, high: if n < range.high n else range.high }
+	match check {
+		BoolExpr(b) if b.boolop == Enums.and_expr => b.args.fold(range, |acc, arg| narrow(acc, arg))
+		AExpr(a) if a.kind == Enums.aexpr_between and is_value(a.lexpr) =>
+			match a.rexpr {
+				NodeList([low_node, high_node]) =>
+					match (integer_of(low_node), integer_of(high_node)) {
+						(Ok(low), Ok(high)) => { low: if low > range.low low else range.low, high: if high < range.high high else range.high }
+						_ => range
+					}
+				_ => range
+			}
+		AExpr(a) if a.kind == Enums.aexpr_op => {
+			op = names_of(a.name).last() ?? ""
+			# `value op n`, or `n op value` with the operator turned around.
+			bound =
+				if is_value(a.lexpr) {
+					integer_of(a.rexpr).map_ok(|n| (op, n))
+				} else if is_value(a.rexpr) {
+					flipped =
+						match op {
+							">=" => "<="
+							"<=" => ">="
+							">" => "<"
+							"<" => ">"
+							other => other
+						}
+					integer_of(a.lexpr).map_ok(|n| (flipped, n))
+				} else {
+					Err(NotABound)
+				}
+			match bound {
+				Ok((">=", n)) => at_least(n)
+				Ok((">", n)) => at_least(n + 1)
+				Ok(("<=", n)) => at_most(n)
+				Ok(("<", n)) => at_most(n - 1)
+				Ok(("=", n)) => { low: if n > range.low n else range.low, high: if n < range.high n else range.high }
+				_ => range
+			}
+		}
+		_ => range
+	}
+}
+
+is_value : Node -> Bool
+is_value = |node|
+	match node {
+		ColumnRef(c) => names_of(c.fields) == ["value"]
+		_ => Bool.False
+	}
+
+## An integer constant, through the casts and signs `pg_dump` writes
+## around one, as in `'-128'::integer` or `(- 1)`.
+integer_of : Node -> Try(I128, [NotAnInteger])
+integer_of = |node|
+	match node {
+		AConst({ val: Integer(i), .. }) => Ok(i.ival.to_i128())
+		AConst({ val: Float(f), .. }) => I128.from_str(f.fval ?? "").map_err(|_| NotAnInteger)
+		AConst({ val: String(s), .. }) => I128.from_str(s.sval ?? "").map_err(|_| NotAnInteger)
+		TypeCast(t) => integer_of(t.arg)
+		AExpr(a) if a.lexpr == Null and names_of(a.name) == ["-"] => integer_of(a.rexpr).map_ok(|n| -n)
+		_ => Err(NotAnInteger)
+	}
+
+DomainDef : { name : Str, schema : Str, base : Str, not_null : Bool, has_default : Bool, bounds : [Bounded(I128, I128), Unbounded] }
+
+resolve_domain : Catalog.Column, List(DomainDef) -> Catalog.Column
 resolve_domain = |column, domains|
 	match domains.find_first(|d| d.name == column.type) {
-		Ok(domain) => { ..column, type: domain.base, not_null: column.not_null or domain.not_null, has_default: column.has_default or domain.has_default }
+		Ok(domain) => { ..column, type: if domain.bounds == Unbounded domain.base else domain.name, not_null: column.not_null or domain.not_null, has_default: column.has_default or domain.has_default }
 		Err(_) => column
 	}
 

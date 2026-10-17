@@ -84,7 +84,7 @@ import Param
 import scram.Scram
 import PgResult
 import Sql
-import Check
+import PgType
 import ParamFormat
 import RowFormat
 
@@ -479,7 +479,7 @@ Client(stream, schema) :: {
 		Row : row
 		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
 		fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| PgDecodeErr("a field of the row type is a record, which a result row cannot fill")
-		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, named)?
+		result = run_checked!(client, Sql.text(sql), Sql.params(sql), fields, Sql.unverified(sql), named)?
 		decode_rows(result, Row.parser_for(RowFormat.Text))
 	}
 
@@ -541,7 +541,7 @@ Client(stream, schema) :: {
 	execute! = |client, sql, params| {
 		Params : params
 		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
-		result = run_checked!(client, Sql.text(sql), Sql.params(sql), [], named)?
+		result = run_checked!(client, Sql.text(sql), Sql.params(sql), [], [], named)?
 		Ok(PgResult.rows_affected(result))
 	}
 
@@ -997,18 +997,19 @@ unexpected_in_login : Str -> Try(a, [PgProtoErr(ProtoBackend.ProtoErr), ..others
 unexpected_in_login = |what| Err(PgProtoErr(UnexpectedMsg("${what} out of turn in the login")))
 
 ## Bind the named parameters in the query's order, run it, and check the
-## result's column types against the row type's fields.
-run_checked! : Client(_, _), Str, List(Str), List(RowFormat.Field), List((Str, Param.Param)) => Try(PgResult.PgResult, Client.TypedErr(_, _, others))
-run_checked! = |client, text, names, fields, named| {
+## types of the result's columns for `unverified`, the fields whose column
+## type the build could not see, against the row type's fields.
+run_checked! : Client(_, _), Str, List(Str), List(RowFormat.Field), List(Str), List((Str, Param.Param)) => Try(PgResult.PgResult, Client.TypedErr(_, _, others))
+run_checked! = |client, text, names, fields, unverified, named| {
 	ordered = ParamFormat.bind(names, named)
 	# `text` was checked when the app was built, by `Sql.from_quote`.
 	{ result, columns } = run_statement!(client, Statement.new_unchecked(text).bind(ordered))?
 	duplicate_field(columns.map(|c| c.name), fields)?
 	for column in columns {
-		match fields.find_first(|f| f.name == column.name) {
+		match fields.find_first(|f| f.name == column.name and unverified.contains(f.name)) {
 			Ok(field) =>
-				match Check.oid_type(column.type_oid) {
-					Ok(type) if !Check.compatible(type, field.kind) => return Err(PgTypeMismatch({ column: column.name, type, field: field.kind }))
+				match PgType.from_oid(column.type_oid) {
+					Ok(type) if !PgType.field_holds(field.kind, PgType.values(type), type) => return Err(PgTypeMismatch({ column: column.name, type, field: field.kind }))
 					_ => {}
 				}
 			Err(_) => {}

@@ -39,7 +39,7 @@ import RowFormat
 import Catalog
 import Check
 
-Sql(schema, params, row) :: { text : Str, params : List(Str) }.{
+Sql(schema, params, row) :: { text : Str, params : List(Str), unverified : List(Str) }.{
 	from_quote : Str -> Try(Sql(schema, params, row), [BadQuotedBytes(Str)])
 		where [
 			schema.catalog : {} -> Catalog,
@@ -53,7 +53,7 @@ Sql(schema, params, row) :: { text : Str, params : List(Str) }.{
 		param_fields = RowFormat.shape(Params.parser_for(RowFormat.Nulls), Params.parser_for(RowFormat.Kinds)) ? |_| BadQuotedBytes("a field of the parameter record is a record, which is no parameter")
 		row_fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| BadQuotedBytes("a field of the row type is a record, which a result row cannot fill")
 		match check(raw, Schema.catalog({}), param_fields, row_fields) {
-			Ok({ text, params: names }) => Ok(Sql.{ text, params: names })
+			Ok({ text, params: names, unverified }) => Ok(Sql.{ text, params: names, unverified })
 			Err(message) => Err(BadQuotedBytes(message))
 		}
 	}
@@ -66,12 +66,17 @@ Sql(schema, params, row) :: { text : Str, params : List(Str) }.{
 	## The parameter names, in the order of `$1`, `$2`, ...
 	params : Sql(schema, params, row) -> List(Str)
 	params = |sql| sql.params
+
+	## The fields of the row type whose column type the build could not see,
+	## which the query's result description is checked against when it runs.
+	unverified : Sql(schema, params, row) -> List(Str)
+	unverified = |sql| sql.unverified
 }
 
 ## Everything `from_quote` checks, as a plain function: the SQL against the
 ## catalog, the placeholders against the fields of the parameter record,
 ## and the result columns against the fields of the row type.
-check : Str, Catalog, List(RowFormat.Field), List(RowFormat.Field) -> Try({ text : Str, params : List(Str) }, Str)
+check : Str, Catalog, List(RowFormat.Field), List(RowFormat.Field) -> Try({ text : Str, params : List(Str), unverified : List(Str) }, Str)
 check = |raw, catalog, param_fields, row_fields| {
 	toks = Lex.tokens(raw) ? |err| Lex.err_to_str(raw, err)
 	match toks.find_first(|t| is_positional(t.kind)) {
@@ -86,8 +91,13 @@ check = |raw, catalog, param_fields, row_fields| {
 		[first, ..] => return Err(first)
 		[] => {}
 	}
-	row_problem(result.outputs, row_fields)?
-	Ok({ text, params: names })
+	row_problem(result.outputs, row_fields, catalog)?
+	unverified =
+		match result.outputs {
+			Known(outputs) => row_fields.keep_if(|f| outputs.any(|o| o.name == f.name and o.type == Unknown)).map(|f| f.name)
+			Unknown => row_fields.map(|f| f.name)
+		}
+	Ok({ text, params: names, unverified })
 }
 
 ## Run Postgres's grammar over `raw` and return the one statement's tree.
@@ -122,8 +132,8 @@ param_problem = |placeholders, fields| {
 }
 
 ## The first mismatch between the result columns and the row type's fields.
-row_problem : [Known(List(Check.Output)), Unknown], List(RowFormat.Field) -> Try({}, Str)
-row_problem = |analysis, fields|
+row_problem : [Known(List(Check.Output)), Unknown], List(RowFormat.Field), Catalog -> Try({}, Str)
+row_problem = |analysis, fields, catalog|
 	match analysis {
 		Known(outputs) => {
 			for field in fields {
@@ -134,7 +144,7 @@ row_problem = |analysis, fields|
 					}
 					[output] => {
 						match output.type {
-							Known(type) if !Check.compatible(type, field.kind) => return Err("column `${field.name}` is `${type}`, but its field is `${field.kind}`")
+							Known(type) if !Check.fits(catalog, type, field.kind) => return Err("column `${field.name}` is `${type}`, but its field is `${field.kind}`")
 							_ => {}
 						}
 						if output.nullable == Yes and !field.nullable {
@@ -163,10 +173,10 @@ field : Str, Str, Bool -> RowFormat.Field
 field = |name, kind, nullable| { name, kind, nullable }
 
 checked : Str, List(Str), List(RowFormat.Field) -> Try({ text : Str, params : List(Str) }, Str)
-checked = |sql, param_names, fields| check(sql, test_catalog, param_names.map(|name| field(name, "Str", Bool.False)), fields)
+checked = |sql, param_names, fields| check(sql, test_catalog, param_names.map(|name| field(name, "Str", Bool.False)), fields).map_ok(|r| { text: r.text, params: r.params })
 
 typed : Str, List(RowFormat.Field) -> Try({ text : Str, params : List(Str) }, Str)
-typed = |sql, params| check(sql, test_catalog, params, [])
+typed = |sql, params| check(sql, test_catalog, params, []).map_ok(|r| { text: r.text, params: r.params })
 
 expect checked("select id, name from students where school_id = $school_id and name <> $name", ["name", "school_id"], [field("id", "I32", Bool.False), field("name", "Str", Bool.False)]) == Ok({ text: "select id, name from students where school_id = $1 and name <> $2", params: ["school_id", "name"] })
 expect checked("select id from students where id = $1", ["id"], [field("id", "I32", Bool.False)]) == Err("use `$name` placeholders named after the fields of the parameter record, not `$1` (at line 1, column 36)")
@@ -205,5 +215,31 @@ expect typed("select id from students where lower(name) = lower($n)", [field("n"
 expect typed("select id from students where lower(name) = $n", [field("n", "Bool", Bool.False)]) == Err("`$n` is `Bool`, but `=` takes `text` there")
 expect typed("select id from students where ($min::integer is null or id >= $min)", [field("min", "Dec", Bool.True)]) == Err("`$min` is `Dec`, but the cast takes `integer` there")
 expect typed("select id from students where name = $id::text", [field("id", "I32", Bool.False)]) == Ok({ text: "select id from students where name = $1::text", params: ["id"] })
-expect check("select id from students", Catalog.none, [], [field("id", "I32", Bool.False)]) == Ok({ text: "select id from students", params: [] })
+expect check("select id from students", Catalog.none, [], [field("id", "I32", Bool.False)]) == Ok({ text: "select id from students", params: [], unverified: ["id"] })
+expect check("select id, name from students", test_catalog, [], [field("id", "I32", Bool.False), field("name", "Str", Bool.False)]).map_ok(|r| r.unverified) == Ok([])
 expect check("select id from students", Catalog.parse("") ?? Catalog.none, [], []) == Err("table `students` does not exist in the schema")
+
+# Numbers fit a field that holds every value of them, and a domain that
+# bounds its integers lets a narrower one take them.
+domain_catalog : Catalog
+domain_catalog =
+	Catalog.parse(
+		\\CREATE DOMAIN public.u8 AS smallint CONSTRAINT u8_check CHECK (((VALUE >= 0) AND (VALUE <= 255)));
+		\\CREATE DOMAIN public.percent AS integer CHECK (VALUE BETWEEN 0 AND 100);
+		\\CREATE DOMAIN public.signed AS integer CHECK (VALUE >= '-5'::integer) CHECK (VALUE <= 5);
+		\\CREATE TABLE public.pixels (red public.u8 NOT NULL, done public.percent NOT NULL, tilt public.signed NOT NULL, big bigint NOT NULL, small smallint NOT NULL);
+	)
+	?? Catalog.none
+
+in_domains : Str, List(RowFormat.Field), List(RowFormat.Field) -> Try({}, Str)
+in_domains = |sql, params, fields| check(sql, domain_catalog, params, fields).map_ok(|_| {})
+
+expect in_domains("select red, done, tilt from pixels", [], [field("red", "U8", Bool.False), field("done", "U8", Bool.False), field("tilt", "I8", Bool.False)]) == Ok({})
+expect in_domains("select red from pixels", [], [field("red", "I8", Bool.False)]) == Err("column `red` is `u8`, but its field is `I8`")
+expect in_domains("select small from pixels", [], [field("small", "U8", Bool.False)]) == Err("column `small` is `smallint`, but its field is `U8`")
+expect in_domains("select big from pixels", [], [field("big", "I32", Bool.False)]) == Err("column `big` is `bigint`, but its field is `I32`")
+expect in_domains("select small, big from pixels", [], [field("small", "I32", Bool.False), field("big", "Dec", Bool.False)]) == Ok({})
+expect in_domains("select red + 1 as r from pixels", [], [field("r", "I32", Bool.False)]) == Ok({})
+expect in_domains("update pixels set red = $red where big = $big", [field("red", "U8", Bool.False), field("big", "I32", Bool.False)], []) == Ok({})
+expect in_domains("update pixels set red = $red", [field("red", "I16", Bool.False)], []) == Err("column `red` is `u8`, but `$red` is `I16`")
+expect in_domains("update pixels set small = $s", [field("s", "I32", Bool.False)], []) == Err("column `small` is `smallint`, but `$s` is `I32`")

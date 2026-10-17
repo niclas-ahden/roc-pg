@@ -10,6 +10,7 @@
 import Catalog
 import Enums
 import Overload
+import PgType
 import Lex
 import Node
 import Parse
@@ -41,63 +42,12 @@ Check :: [].{
 		{ ..result, problems: result.problems.fold([], |acc, p| if acc.contains(p) acc else acc.append(p)) }
 	}
 
-	## The name of a built in Postgres type, from its OID as a result
-	## description reports it.
-	oid_type : I32 -> Try(Str, [UnknownOid])
-	oid_type = |oid|
-		match oid {
-			16 => Ok("boolean")
-			17 => Ok("bytea")
-			20 => Ok("bigint")
-			21 => Ok("smallint")
-			23 => Ok("integer")
-			25 => Ok("text")
-			114 => Ok("json")
-			700 => Ok("real")
-			701 => Ok("double precision")
-			869 => Ok("inet")
-			1000 => Ok("boolean[]")
-			1005 => Ok("smallint[]")
-			1007 => Ok("integer[]")
-			1009 => Ok("text[]")
-			1015 => Ok("character varying[]")
-			1016 => Ok("bigint[]")
-			1021 => Ok("real[]")
-			1022 => Ok("double precision[]")
-			1042 => Ok("character")
-			1043 => Ok("character varying")
-			1082 => Ok("date")
-			1083 => Ok("time without time zone")
-			1114 => Ok("timestamp without time zone")
-			1184 => Ok("timestamp with time zone")
-			1231 => Ok("numeric[]")
-			1700 => Ok("numeric")
-			2950 => Ok("uuid")
-			3802 => Ok("jsonb")
-			_ => Err(UnknownOid)
-		}
-
-	## Whether a column of Postgres type `type` fits a record field that
-	## decodes as `kind` (a `RowFormat.Field` kind). Types and kinds this does not
-	## know always fit.
-	compatible : Str, Str -> Bool
-	compatible = |type, kind|
-		if kind == "Str" or kind == "" {
-			Bool.True
-		} else if type.ends_with("[]") {
-			if kind.starts_with("List(") {
-				Check.compatible(type.drop_suffix("[]"), kind.drop_prefix("List(").drop_suffix(")"))
-			} else {
-				Bool.False
-			}
-		} else if kind.starts_with("List(") {
-			!known_type(type)
-		} else {
-			match allowed_types(kind) {
-				Ok(allowed) => !known_type(type) or allowed.contains(type)
-				Err(_) => Bool.True
-			}
-		}
+	## Whether a result column of `type`, as the analysis gives it, fits a
+	## row field that decodes as `kind`: the field takes every value the
+	## column can hold (see [PgType.field_holds]), the bounds of a domain
+	## such as `u8` included.
+	fits : Catalog, Str, Str -> Bool
+	fits = |catalog, type, kind| PgType.field_holds(kind, values_in(catalog, type), base_in(catalog, type))
 
 	## A hint for a name that is probably a misspelling of one of `names`,
 	## such as `` (did you mean `school_id`?)``, or "" when none is close.
@@ -192,29 +142,30 @@ Lookup : [Found(Check.Output), Missing(Str), Unsure]
 no_outputs : Check.Result
 no_outputs = { outputs: Unknown, problems: [] }
 
-int2 = ["smallint", "int2", "smallserial"]
-int4 = ["integer", "int", "int4", "serial"]
-int8 = ["bigint", "int8", "bigserial"]
-numeric = ["numeric", "decimal"]
-float4 = ["real", "float4"]
-float8 = ["double precision", "float8", "float"]
-booleans = ["boolean", "bool"]
-texts = ["text", "character varying", "varchar", "character", "char", "bpchar", "name", "citext", "uuid", "date", "time without time zone", "time with time zone", "time", "timetz", "timestamp without time zone", "timestamp with time zone", "timestamp", "timestamptz", "interval", "json", "jsonb", "inet", "cidr", "macaddr", "bytea", "xml", "tsvector", "money"]
+## The type a bounded domain is of, or `type` itself.
+base_in : Catalog, Str -> Str
+base_in = |catalog, type|
+	if type.ends_with("[]") {
+		"${base_in(catalog, type.drop_suffix("[]"))}[]"
+	} else {
+		catalog.domain(type).map_ok(|d| d.base) ?? type
+	}
 
-known_type : Str -> Bool
-known_type = |type| [int2, int4, int8, numeric, float4, float8, booleans, texts].any(|group| group.contains(type))
+## The values a column of `type` holds, those of a bounded domain's range.
+values_in : Catalog, Str -> PgType.Values
+values_in = |catalog, type|
+	match catalog.domain(type) {
+		Ok(d) => Integers(d.low, d.high)
+		Err(_) => PgType.values(type)
+	}
 
-allowed_types : Str -> Try(List(Str), [NoRule])
-allowed_types = |kind|
-	match kind {
-		"Bool" => Ok(booleans)
-		"I8" | "I16" | "U8" | "U16" => Ok(int2.concat(int4))
-		"I32" => Ok(int2.concat(int4))
-		"U32" | "I64" | "U64" => Ok(int2.concat(int4).concat(int8))
-		"Dec" => Ok(int2.concat(int4).concat(int8).concat(numeric))
-		"F32" => Ok(float4)
-		"F64" => Ok(float4.concat(float8))
-		_ => Err(NoRule)
+## An argument as picking a function or operator sees it: a bounded
+## domain is its base type.
+base_arg : Overload.Arg, Env -> Overload.Arg
+base_arg = |arg, env|
+	match arg {
+		Known(t) => Known(base_in(env.catalog, t))
+		other => other
 	}
 
 statement : Node, Env -> Check.Result
@@ -1207,7 +1158,7 @@ const_type = |val|
 ## cast for it.
 shared_type : Str, List(Overload.Arg), Env -> { type : [Known(Str), Unknown], problems : List(Str) }
 shared_type = |context, args, env|
-	match Overload.common(args, env.enums) {
+	match Overload.common(args.map(|a| base_arg(a, env)), env.enums) {
 		Ok(t) => { type: Known(t), problems: [] }
 		Err(Mismatch(a, b)) => { type: Unknown, problems: ["${context} types ${a} and ${b} cannot be matched"] }
 		Err(NoConversion(from, to)) => { type: Known(to), problems: if refuses_calls(env) ["${context} could not convert type ${from} to ${to}"] else [] }
@@ -1307,8 +1258,8 @@ single_arg = |operands|
 operator_choice : Node.AExpr, List(Typed), List(Typed), Env -> Try(Overload.Choice, Overload.Miss)
 operator_choice = |a, lefts, rights, env|
 	match a.lexpr {
-		Null => Overload.operator(op_name(a), Prefix, single_arg(rights), env.enums)
-		_ => Overload.operator(op_name(a), Infix(single_arg(lefts)), single_arg(rights), env.enums)
+		Null => Overload.operator(op_name(a), Prefix, base_arg(single_arg(rights), env), env.enums)
+		_ => Overload.operator(op_name(a), Infix(base_arg(single_arg(lefts), env)), base_arg(single_arg(rights), env), env.enums)
 	}
 
 ## A strict operator is NULL when an operand is. On numbers, strings,
@@ -1353,7 +1304,7 @@ function_choice = |f, args, env| {
 				_ => Unqualified
 			}
 		builtins = schema == Unqualified or schema == Qualified("pg_catalog")
-		Overload.function_from(names_of(f.funcname).last() ?? "", args.map(|a| a.arg), env.enums, builtins, env.catalog.functions_in(schema))
+		Overload.function_from(names_of(f.funcname).last() ?? "", args.map(|a| base_arg(a.arg, env)), env.enums, builtins, env.catalog.functions_in(schema))
 	}
 }
 
@@ -1669,7 +1620,7 @@ in_problems = |a, lefts, rights, env|
 		left = single_arg(lefts)
 		rights.keep_oks(
 			|item|
-				match Overload.operator(op_name(a), Infix(left), item.arg, env.enums) {
+				match Overload.operator(op_name(a), Infix(base_arg(left, env)), base_arg(item.arg, env), env.enums) {
 					Err(NoMatch) | Err(NoSuchName) => Ok("operator `${arg_text(left)} ${op_name(a)} ${arg_text(item.arg)}` does not exist")
 					_ => Err(Fits)
 				},
@@ -1683,7 +1634,7 @@ param_type_problems = |p, type, what, env|
 	match param_name(p, env) {
 		Ok(name) =>
 			match env.params.find_first(|q| q.name == name) {
-				Ok(param) if type != "" and !param_fits(type, param.kind) => ["`$${name}` is `${param.kind}`, but ${what} takes `${type}` there"]
+				Ok(param) if type != "" and !param_fits(type, param.kind, env) => ["`$${name}` is `${param.kind}`, but ${what} takes `${type}` there"]
 				_ => []
 			}
 		Err(_) => []
@@ -1823,7 +1774,7 @@ param_problems = |name, column_name, column, stored, env|
 		Ok(param) => {
 			type_problem =
 				match column.type {
-					Known(type) if !param_fits(type, param.kind) => ["column `${column_name}` is `${type}`, but `$${name}` is `${param.kind}`"]
+					Known(type) if !param_fits(type, param.kind, env) => ["column `${column_name}` is `${type}`, but `$${name}` is `${param.kind}`"]
 					_ => []
 				}
 			null_problem =
@@ -1842,35 +1793,14 @@ param_problems = |name, column_name, column, stored, env|
 array_param_problems : Str, Str, Check.Output, Env -> List(Str)
 array_param_problems = |name, column_name, column, env|
 	match (env.params.find_first(|p| p.name == name), column.type) {
-		(Ok(param), Known(type)) if !param_fits("${type}[]", param.kind) => ["column `${column_name}` is `${type}`, so `$${name}` must be a list of it, but it is `${param.kind}`"]
+		(Ok(param), Known(type)) if !param_fits("${type}[]", param.kind, env) => ["column `${column_name}` is `${type}`, so `$${name}` must be a list of it, but it is `${param.kind}`"]
 		_ => []
 	}
 
-## Whether a parameter that encodes as `kind` fits a column of Postgres
-## type `type`. Types and kinds this does not know always fit, and so does
-## `Str`, which the server parses as the column's type.
-param_fits : Str, Str -> Bool
-param_fits = |type, kind|
-	if kind == "Str" or kind == "" {
-		Bool.True
-	} else if type.ends_with("[]") {
-		if kind.starts_with("List(") {
-			param_fits(type.drop_suffix("[]"), kind.drop_prefix("List(").drop_suffix(")"))
-		} else {
-			Bool.False
-		}
-	} else if kind.starts_with("List(") {
-		!known_type(type)
-	} else if !known_type(type) {
-		Bool.True
-	} else {
-		match kind {
-			"Bool" => booleans.contains(type)
-			"I8" | "I16" | "I32" | "I64" | "U8" | "U16" | "U32" | "U64" => [int2, int4, int8, numeric, float4, float8].any(|group| group.contains(type))
-			"Dec" | "F32" | "F64" => [numeric, float4, float8].any(|group| group.contains(type))
-			_ => Bool.True
-		}
-	}
+## Whether a parameter that encodes as `kind` fits where the server takes
+## `type`: the type holds every value of it (see [PgType.column_holds]).
+param_fits : Str, Str, Env -> Bool
+param_fits = |type, kind, env| PgType.column_holds(base_in(env.catalog, type), values_in(env.catalog, type), kind)
 
 ## The target of an insert, update or delete.
 target_rel : Node, Env -> { rel : Rel, problems : List(Str) }
@@ -1961,7 +1891,7 @@ value_problems : Node, Check.Output, Str, Check.Output, Env -> List(Str)
 value_problems = |value, output, column_name, column, env| {
 	fits =
 		match (output.type, column.type) {
-			(Known(from), Known(to)) if !Overload.can_assign(from, to, env.enums) => ["column `${column_name}` is `${to}`, but the value is `${from}`"]
+			(Known(from), Known(to)) if !Overload.can_assign(base_in(env.catalog, from), base_in(env.catalog, to), env.enums) => ["column `${column_name}` is `${to}`, but the value is `${from}`"]
 			_ => []
 		}
 	match value {
@@ -2038,7 +1968,7 @@ insert_shape_problems = |source, listed, target, env| {
 							[],
 							|acc, (o, i)|
 								match (o.type, columns.get(i).map_ok(|col| (col, column_in(target, col)))) {
-									(Known(from), Ok((col, Found({ type: Known(to), .. })))) if !Overload.can_assign(from, to, env.enums) =>
+									(Known(from), Ok((col, Found({ type: Known(to), .. })))) if !Overload.can_assign(base_in(env.catalog, from), base_in(env.catalog, to), env.enums) =>
 										acc.append("column `${col}` is `${to}`, but the query gives `${from}`")
 									_ => acc
 								},
@@ -2368,22 +2298,22 @@ expect outputs("select case when id > 1 then name end as n from students") == ["
 expect outputs("select array(select id from schools) as ids, current_date") == ["ids integer[]", "current_date date"]
 expect outputs("values (1, 'a'), (2, null)") == ["column1 integer", "column2 text null"]
 expect outputs("select id from students except select school_id from students") == ["id integer"]
-expect Check.compatible("integer", "I32")
-expect !Check.compatible("bigint", "I32")
-expect Check.compatible("bigint", "I64")
-expect Check.compatible("numeric", "Dec")
-expect !Check.compatible("numeric", "F64")
-expect Check.compatible("text", "Str")
+expect Check.fits(test_catalog, "integer", "I32")
+expect !Check.fits(test_catalog, "bigint", "I32")
+expect Check.fits(test_catalog, "bigint", "I64")
+expect Check.fits(test_catalog, "numeric", "Dec")
+expect !Check.fits(test_catalog, "numeric", "F64")
+expect Check.fits(test_catalog, "text", "Str")
 expect Check.suggestion("schol_id", ["id", "school_id"]) == " (did you mean `school_id`?)"
 expect Check.suggestion("phnoe", ["name", "phone"]) == " (did you mean `phone`?)"
 expect Check.suggestion("email", ["id", "name"]) == ""
 expect Check.suggestion("nm", ["name"]) == ""
-expect Check.compatible("bigint", "Str")
-expect !Check.compatible("text", "I32")
-expect Check.compatible("text[]", "List(Str)")
-expect !Check.compatible("text[]", "I32")
-expect Check.compatible("access_level", "Str")
-expect Check.compatible("some_domain", "I32")
+expect Check.fits(test_catalog, "bigint", "Str")
+expect !Check.fits(test_catalog, "text", "I32")
+expect Check.fits(test_catalog, "text[]", "List(Str)")
+expect !Check.fits(test_catalog, "text[]", "I32")
+expect Check.fits(test_catalog, "access_level", "Str")
+expect Check.fits(test_catalog, "some_domain", "I32")
 
 # Function calls and operators, typed from Postgres's catalog.
 expect outputs("select sum(id) as total, avg(id) as mean, max(name) as last from students") == ["total bigint null", "mean numeric null", "last text null"]
