@@ -35,6 +35,12 @@ Consts :: [].{
 	resolve : Consts.Table, Str -> Try(Consts.Value, [Unknown(Str)])
 	resolve = |table, name| resolve_depth(table, name, 0)
 
+	## The enum entries of `sources` whose value is an expression that
+	## does not evaluate, as `NAME = text`. Each would otherwise silently
+	## take the value after the previous entry.
+	unresolved : List(Str), Consts.Table -> List(Str)
+	unresolved = |sources, table| sources.fold([], |acc, source| enum_blocks(source, table).fold(acc, |a, b| a.concat(b.unresolved)))
+
 	## A C integer literal: decimal, hex or octal, with any suffix.
 	number : Str -> Try(I64, [NotNumber])
 	number = |text| c_number(text)
@@ -231,7 +237,7 @@ enums_of = |source, table| enum_blocks(source, table).fold([], |acc, block| acc.
 
 ## Each `enum { ... }` block: the name it is known by, the typedef name
 ## after its closing brace or else its tag, and its values.
-enum_blocks : Str, Consts.Table -> List({ name : Str, values : List((Str, I64)) })
+enum_blocks : Str, Consts.Table -> List({ name : Str, values : List((Str, I64)), unresolved : List(Str) })
 enum_blocks = |source, table| {
 	text = strip_comments(source)
 	blocks = text.split_on("enum").drop_first(1)
@@ -249,6 +255,7 @@ enum_blocks = |source, table| {
 				name = if after.is_empty() head.trim() else after
 				var $next = 0.I64
 				var $values = []
+				var $unresolved = []
 				for item in body.split_on(",") {
 					entry = item.trim()
 					if !entry.is_empty() and !entry.starts_with("#") {
@@ -256,13 +263,12 @@ enum_blocks = |source, table| {
 						value =
 							match entry.split_first("=") {
 								Ok({ after: value_text, .. }) =>
-									match CParse.expression_text(value_text.trim()) {
-										Ok(expr) =>
-											match evaluate(table, expr, 0) {
-												Ok(Int(v)) => v
-												_ => $next
-											}
-										Err(_) => $next
+									match CParse.expression_text(value_text.trim()).map_ok(|expr| evaluate(table, expr, 0)) {
+										Ok(Ok(Int(v))) => v
+										_ => {
+											$unresolved = $unresolved.append("${entry_name} = ${value_text.trim()}")
+											$next
+										}
 									}
 								Err(_) => $next
 							}
@@ -272,7 +278,7 @@ enum_blocks = |source, table| {
 						$next = value + 1
 					}
 				}
-				acc.append({ name, values: $values })
+				acc.append({ name, values: $values, unresolved: $unresolved })
 			}
 		},
 	)

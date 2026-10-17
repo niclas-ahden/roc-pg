@@ -7,12 +7,15 @@
 ##
 ##     roc tools/actions.roc
 ##
-## What cannot be translated is written to `local/gram/problems.txt`.
+## What cannot be translated is printed and written to
+## `local/gram/problems.txt`, with where it is in `gram.y`. Then nothing
+## else is written, and the program exits with an error.
 app [main!] {
 	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
 }
 
 import pf.Stdout
+import pf.Stderr
 import pf.Path
 import pf.OsStr
 import GramC
@@ -69,23 +72,25 @@ main! = |_args| {
 	structs = structs_list.fold(Dict.empty(), |acc, s| if acc.contains(s.name) acc else acc.insert(s.name, s.fields))
 
 	# The grammar actions.
-	lengths = GramC.rule_lengths(gram_c)
-	var $problems = []
+	lengths = GramC.rule_lengths(gram_c)?
+	var $problems = Consts.unresolved($headers, consts).map(|entry| "enum value not evaluated: ${entry}")
 	var $actions = []
-	for a in GramC.actions(gram_c) {
+	for a in GramC.actions(gram_c)? {
 		match CParse.statement(a.code) {
 			Ok(body) => {
-				$actions = $actions.append({ rule: a.rule, rule_text: a.rule_text, body })
+				$actions = $actions.append({ rule: a.rule, rule_text: a.rule_text, body, code: a.code, line: a.line })
 			}
 			Err(message) => {
-				$problems = $problems.append("rule ${a.rule.to_str()}: C not read: ${message}")
+				$problems = $problems.append(action_problem(a, "C not read: ${message}"))
 			}
 		}
 	}
 
 	# The helper functions they may call, gram.y's own first.
 	helper_sources = [epilogue, read!("${src}/backend/nodes/makefuncs.c")?, read!("${src}/backend/nodes/value.c")?, read!("${src}/backend/commands/define.c")?, read!("${src}/backend/nodes/nodeFuncs.c")?]
-	all_funcs = helper_sources.fold(Dict.empty(), |acc, source| CParse.functions(source).funcs.fold(acc, |d, f| if d.contains(f.name) d else d.insert(f.name, f)))
+	parsed_helpers = helper_sources.map(CParse.functions)
+	all_funcs = parsed_helpers.fold(Dict.empty(), |acc, r| r.funcs.fold(acc, |d, f| if d.contains(f.name) d else d.insert(f.name, f)))
+	unread_funcs = parsed_helpers.fold([], |acc, r| acc.concat(r.failed))
 
 	# Every helper the actions reach, following calls.
 	var $wanted = []
@@ -100,7 +105,13 @@ main! = |_args| {
 					$wanted = $wanted.append(name)
 					$queue = $queue.concat(Walk.calls(f.body))
 				}
-				Err(_) => {}
+				Err(_) =>
+					match unread_funcs.find_first(|u| u.name == name) {
+						Ok(u) => {
+							$problems = $problems.append("helper ${name}: C not read: ${u.error}")
+						}
+						Err(_) => {}
+					}
 			}
 		}
 	}
@@ -163,7 +174,7 @@ main! = |_args| {
 		len = lengths.get(a.rule) ?? 0
 		out = Translate.action_template(env, a.rule, len, a.rule_text, a.body)
 		$rules = RuleBodies.add($rules, a.rule, a.rule_text, out)
-		$problems = $problems.concat(out.problems)
+		$problems = $problems.concat(out.problems.map(|p| action_problem(a, p)))
 	}
 	var $func_code = []
 	for f in funcs {
@@ -203,19 +214,43 @@ main! = |_args| {
 			.append(hand),
 		"\n",
 	)
+	problems = $problems.concat(json.unknown.map(|u| "JSON: field type not written: ${u}"))
+	Path.write_utf8!(Path.utf8("local/gram/problems.txt"), Str.join_with(problems, "\n\n"))?
+	Stdout.line!("${$actions.len().to_str()} actions (${$rules.code.len().to_str()} distinct bodies), ${funcs.len().to_str()} helpers translated, ${types.len().to_str()} node types, ${problems.len().to_str()} problems (local/gram/problems.txt)")?
+	if !problems.is_empty() {
+		# Code with a gap in it is never written over the package's.
+		for p in problems {
+			Stderr.line!("\n${p}")?
+		}
+		return Err(Untranslated(problems.len()))
+	}
 	Path.write_utf8!(Path.utf8("package/Node.roc"), node_roc)?
 	Path.write_utf8!(Path.utf8("package/Actions.roc"), actions_roc)?
 	Path.write_utf8!(Path.utf8("package/Enums.roc"), enums_module(header, types, structs, enums))?
 	Path.write_utf8!(Path.utf8("tests/NodeJson.roc"), json.code)?
-	for u in json.unknown {
-		Stdout.line!("  JSON: field type not written: ${u}")?
-	}
-	Path.write_utf8!(Path.utf8("local/gram/problems.txt"), Str.join_with($problems, "\n"))?
-	Stdout.line!("${$actions.len().to_str()} actions (${$rules.code.len().to_str()} distinct bodies), ${funcs.len().to_str()} helpers translated, ${types.len().to_str()} node types, ${$problems.len().to_str()} problems (local/gram/problems.txt)")?
-	for p in $problems.take_first(30) {
-		Stdout.line!("  ${p}")?
-	}
 	Ok({})
+}
+
+## A problem with one grammar action: where it is in `gram.y`, the rule,
+## and the start of its C code.
+action_problem : { rule : U64, rule_text : Str, code : Str, line : U64, ..}, Str -> Str
+action_problem = |a, message| {
+	# The translator names the rule itself, and CParse counts lines from the
+	# start of the action.
+	unnamed = message.drop_prefix("rule ${a.rule.to_str()} (${a.rule_text}): ")
+	text =
+		match unnamed.drop_prefix("C not read: line ").split_first(": ") {
+			Ok({ before, after }) if unnamed.starts_with("C not read: line ") =>
+				match U64.from_str(before) {
+					Ok(n) => "C not read at gram.y:${(a.line + n - 1).to_str()}: ${after}"
+					Err(_) => unnamed
+				}
+			_ => unnamed
+		}
+	lines =a.code.split_on("\n").map(|l| l.trim()).keep_if(|l| !l.is_empty())
+	shown = lines.take_first(6).map(|l| "    ${l}")
+	more = if lines.len() > 6 ["    ..."] else []
+	Str.join_with(["gram.y:${a.line.to_str()}: rule ${a.rule.to_str()} (${a.rule_text}): ${text}"].concat(shown).concat(more), "\n")
 }
 
 read! : Str => Try(Str, [ReadFailed(Str)])

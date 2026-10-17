@@ -16,7 +16,7 @@ main! : List(OsStr) => Try({}, _)
 main! = |args| {
 	words = args.map(OsStr.display)
 	gram_c = Path.read_utf8!(Path.utf8("local/gram/gram.c"))?
-	actions = GramC.actions(gram_c)
+	actions = GramC.actions(gram_c)?
 	if words.contains("show") {
 		for action in actions {
 			if words.contains(action.rule.to_str()) {

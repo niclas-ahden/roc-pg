@@ -41,9 +41,12 @@ main! = |_args| {
 	kwlist = Path.read_utf8!(Path.utf8("${pg_dir}/src/include/parser/kwlist.h"))?
 	copyright = Path.read_utf8!(Path.utf8("${pg_dir}/COPYRIGHT"))?
 
-	numbers = token_numbers(h)
-	keyword_tokens = keyword_token_names(kwlist).map(|name| number_of(numbers, name))
-	named = |name| number_of(numbers, name)
+	numbers = token_numbers(h)?
+	var $keyword_tokens = []
+	for name in keyword_token_names(kwlist) {
+		$keyword_tokens = $keyword_tokens.append(number_of(numbers, name)?)
+	}
+	keyword_tokens = $keyword_tokens
 
 	tables = [
 		("translate", array(c, "yytranslate")?),
@@ -104,7 +107,7 @@ main! = |_args| {
 		("without_la", "WITHOUT_LA"),
 		("mode_type_name", "MODE_TYPE_NAME"),
 	] {
-		$out = $out.concat("\t${field}_token : I64\n\t${field}_token = ${named(token).to_str()}\n\n")
+		$out = $out.concat("\t${field}_token : I64\n\t${field}_token = ${number_of(numbers, token)?.to_str()}\n\n")
 	}
 	$out = $out.concat("\t## The token number of each keyword, in the order of [Keywords.all].\n\tkeyword_token : U64 -> I64\n\tkeyword_token = |k| keyword_tokens.get(k) ?? 0\n\n")
 	$out = $out.concat("\t## A grammar symbol's name, as bison prints it.\n\tsymbol_name : I64 -> Str\n\tsymbol_name = |s| symbol_names.get(s.to_u64_wrap()) ?? \"?\"\n\n")
@@ -119,7 +122,7 @@ main! = |_args| {
 	name_lines = names.map(|n| "\t${Str.inspect(n)},")
 	$out = $out.concat("symbol_names : List(Str)\nsymbol_names = [\n${Str.join_with(name_lines, "\n")}\n]\n\n")
 	for (name, values) in tables {
-		$out = $out.concat("${name}_bytes : List(U8)\n${name}_bytes = ${name}_text.to_utf8()\n\n${name}_text : Str\n${name}_text =\n${encode(values)}\n\n")
+		$out = $out.concat("${name}_bytes : List(U8)\n${name}_bytes = ${name}_text.to_utf8()\n\n${name}_text : Str\n${name}_text =\n${encode(name, values)?}\n\n")
 	}
 	$out = $out.concat(decoder)
 	Path.write_utf8!(Path.utf8("package/Grammar.roc"), $out)?
@@ -137,14 +140,16 @@ define = |c, name| {
 }
 
 ## The numbers of a `static const ... name[] = { ... };` table.
-array : Str, Str -> Try(List(I64), [MissingTable(Str)])
+array : Str, Str -> Try(List(I64), [MissingTable(Str), BadTableEntry(Str, Str)])
 array = |c, name| {
 	after = c.split_first(" ${name}[] =").map_ok(|s| s.after) ? |_| MissingTable(name)
 	body = after.split_first("{").map_ok(|s| s.after) ? |_| MissingTable(name)
 	inside = body.split_first("}").map_ok(|s| s.before) ? |_| MissingTable(name)
-	numbers : List(I64)
-	numbers = inside.split_on(",").map(|s| s.trim()).keep_if(|s| !s.is_empty()).map(|s| I64.from_str(s) ?? 0)
-	Ok(numbers)
+	var $numbers = []
+	for entry in inside.split_on(",").map(|s| s.trim()).keep_if(|s| !s.is_empty()) {
+		$numbers = $numbers.append(I64.from_str(entry) ? |_| BadTableEntry(name, entry))
+	}
+	Ok($numbers)
 }
 
 ## The strings of `yytname`, unquoted.
@@ -182,10 +187,11 @@ string_array = |c, name| {
 }
 
 ## `NAME = 258,` lines of the token enum in bison's header.
-token_numbers : Str -> List((Str, I64))
+token_numbers : Str -> Try(List((Str, I64)), [MissingTokenEnum])
 token_numbers = |h| {
-	enum_body = (h.split_first("enum yytokentype").map_ok(|s| s.after) ?? "").split_first("};").map_ok(|s| s.before) ?? ""
-	enum_body.split_on("\n").fold(
+	tail = h.split_first("enum yytokentype").map_ok(|s| s.after) ? |_| MissingTokenEnum
+	enum_body = tail.split_first("};").map_ok(|s| s.before) ? |_| MissingTokenEnum
+	Ok(enum_body.split_on("\n").fold(
 		[],
 		|acc, line| {
 			code = (line.split_first("/*").map_ok(|s| s.before) ?? line).trim().drop_suffix(",")
@@ -198,14 +204,14 @@ token_numbers = |h| {
 				Err(_) => acc
 			}
 		},
-	)
+	))
 }
 
-number_of : List((Str, I64)), Str -> I64
+number_of : List((Str, I64)), Str -> Try(I64, [MissingToken(Str)])
 number_of = |numbers, name|
 	match numbers.find_first(|(n, _)| n == name) {
-		Ok((_, v)) => v
-		Err(_) => crash "no token ${name} in gram.h"
+		Ok((_, v)) => Ok(v)
+		Err(_) => Err(MissingToken(name))
 	}
 
 ## The token names of `PG_KEYWORD("abort", ABORT_P, ...)` lines, in order.
@@ -223,12 +229,16 @@ keyword_token_names = |kwlist|
 	)
 
 ## Three characters per entry, 32 entries per line, as a multiline string.
-encode : List(I64) -> Str
-encode = |values| {
+encode : Str, List(I64) -> Try(Str, [OutOfRange(Str, I64)])
+encode = |name, values| {
 	digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_".to_utf8()
 	var $lines = []
 	var $cur = []
 	for v in values {
+		# Three base 64 digits hold 0 to 262143.
+		if v + offset < 0 or v + offset >= 262144 {
+			return Err(OutOfRange(name, v))
+		}
 		u = (v + offset).to_u64_wrap()
 		$cur = $cur.concat([digits.get(u // 4096) ?? '0', digits.get((u // 64) % 64) ?? '0', digits.get(u % 64) ?? '0'])
 		if $cur.len() == per_line * 3 {
@@ -241,7 +251,7 @@ encode = |values| {
 	}
 	prefixed : List(Str)
 	prefixed = $lines.map(|l| "\t\\\\${l}")
-	Str.join_with(prefixed, "\n")
+	Ok(Str.join_with(prefixed, "\n"))
 }
 
 decoder =
