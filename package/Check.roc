@@ -163,10 +163,10 @@ Env : { catalog : Catalog, ctes : List({ name : Str, columns : Cols }), outer : 
 
 ## What the select whose select list, `having` and `order by` are being
 ## read groups by: its `group by` expressions, the columns among them by
-## relation and column name, and the relations whose primary key is grouped
-## by, all of whose columns may be read. `NoGroup` for every other clause,
-## and for a select with grouping sets, which are left to the server.
-Group : [NoGroup, Group({ exprs : List(Node), keys : List((Str, Str)), covered : List(Str) })]
+## relation and column name, the relations whose primary key is grouped by,
+## all of whose columns may be read, and the expressions some grouping set
+## leaves out, which are NULL in its rows. `NoGroup` for every other clause.
+Group : [NoGroup, Group({ exprs : List(Node), keys : List((Str, Str)), covered : List(Str), partial : List(Node) })]
 
 ## What one walk over an expression learns, bottom up, so that each node
 ## is read once however deep the expression is.
@@ -370,8 +370,11 @@ simple_select : Node.SelectStmt, Env -> Check.Result
 simple_select = |s, outer_env| {
 	plain = { ..outer_env, grouped: Bool.False, group: NoGroup }
 	{ rels, problems: from_problems } = from_list(s.from_clause, plain)
-	clause_env = { ..plain, grouped: !s.group_clause.is_empty() }
-	env = { ..clause_env, group: group_of(s, rels, clause_env) }
+	grouping = group_of(s, rels, plain)
+	# An empty grouping set, like the one `rollup` adds, makes a row of all
+	# the rows: when there are none, its aggregates see none.
+	clause_env = { ..plain, grouped: !s.group_clause.is_empty() and !grouping.empty }
+	env = { ..clause_env, group: grouping.group }
 	# The rows `where` keeps have no NULL in the columns it rules NULL out.
 	selected = target_list(s.target_list, narrowed(rels, s.where_clause), env)
 	aliases = s.target_list.keep_oks(
@@ -419,41 +422,32 @@ owner = |ref, rels|
 	}
 
 ## What a select groups by, for reading its select list, `having` and
-## `order by`. Grouping sets are left to the server.
-group_of : Node.SelectStmt, List(Rel), Env -> Group
+## `order by`, and whether one of its grouping sets is empty.
+group_of : Node.SelectStmt, List(Rel), Env -> { group : Group, empty : Bool }
 group_of = |s, rels, env| {
-	simple_items =
-		s.group_clause.all(
-			|item|
-				match item {
-					GroupingSet(_) => Bool.False
-					_ => Bool.True
-				},
-		)
-	if !simple_items {
-		NoGroup
-	} else {
-		selected = s.target_list.keep_oks(
-			|t|
-				match t {
-					ResTarget(r) => Ok(r)
-					_ => Err(NotATarget)
-				},
-		)
-		# A position or an output alias in `group by` means that select item.
-		group_exprs = s.group_clause.map(
-			|item|
-				match item {
-					AConst({ val: Integer(i), .. }) => (selected.get((i.ival - 1).to_u64_wrap()) ?? { name: Err(Null), indirection: [], val: item, location: 0 }).val
-					ColumnRef({ fields: [String({ sval: Ok(name) })], .. }) =>
-						match selected.find_first(|t| t.name == Ok(name)) {
-							Ok(t) if !has_column_named(rels, name) => t.val
-							_ => item
-						}
+	selected = s.target_list.keep_oks(
+		|t|
+			match t {
+				ResTarget(r) => Ok(r)
+				_ => Err(NotATarget)
+			},
+	)
+	# A position or an output alias in `group by` means that select item.
+	item_expr = |item|
+		match item {
+			AConst({ val: Integer(i), .. }) => (selected.get((i.ival - 1).to_u64_wrap()) ?? { name: Err(Null), indirection: [], val: item, location: 0 }).val
+			ColumnRef({ fields: [String({ sval: Ok(name) })], .. }) =>
+				match selected.find_first(|t| t.name == Ok(name)) {
+					Ok(t) if !has_column_named(rels, name) => t.val
 					_ => item
-				},
-		)
-		keys = group_exprs.keep_oks(
+				}
+			_ => item
+		}
+	items = s.group_clause.map(|item| grouping_sets(item, item_expr))
+	all = items.fold([], |acc, i| acc.concat(i.all))
+	every = items.fold([], |acc, i| acc.concat(i.every))
+	keys_of = |exprs|
+		exprs.keep_oks(
 			|g|
 				match g {
 					ColumnRef(c) =>
@@ -468,16 +462,53 @@ group_of = |s, rels, env| {
 					_ => Err(NotOwned)
 				},
 		)
-		covered = rels.keep_if(
-			|r|
-				match env.catalog.table(r.table) {
-					Ok(table) if !table.primary_key.is_empty() and r.columns != Unknown => table.primary_key.all(|col| keys.contains((r.alias, col)))
-					_ => Bool.False
-				},
-		).map(|r| r.alias)
-		Group({ exprs: group_exprs, keys, covered })
+	# Any column of any grouping set may be read, but only those every set
+	# groups by make a table's primary key grouped.
+	common_keys = keys_of(every)
+	covered = rels.keep_if(
+		|r|
+			match env.catalog.table(r.table) {
+				Ok(table) if !table.primary_key.is_empty() and r.columns != Unknown => table.primary_key.all(|col| common_keys.contains((r.alias, col)))
+				_ => Bool.False
+			},
+	).map(|r| r.alias)
+	partial = all.drop_if(|e| every.any(|c| Node.equal(c, e)))
+	{
+		group: Group({ exprs: all, keys: keys_of(all), covered, partial }),
+		empty: !items.is_empty() and items.all(|i| i.empty),
 	}
 }
+
+## What one `group by` item groups by, as `expand_grouping_sets` expands
+## it: every expression a set of it holds, those all its sets hold, and
+## whether one of its sets is empty. `rollup` and `cube` always have the
+## empty set among theirs.
+grouping_sets : Node, (Node -> Node) -> { all : List(Node), every : List(Node), empty : Bool }
+grouping_sets = |item, item_expr|
+	match item {
+		GroupingSet(g) => {
+			parts = g.content.map(|part| grouping_sets(part, item_expr))
+			all = parts.fold([], |acc, p| acc.concat(p.all))
+			if g.kind == Enums.grouping_set_empty {
+				{ all: [], every: [], empty: Bool.True }
+			} else if g.kind == Enums.grouping_set_simple {
+				{ all, every: all, empty: g.content.is_empty() }
+			} else if g.kind == Enums.grouping_set_sets {
+				every =
+					match parts.first() {
+						Ok(first) => first.every.keep_if(|e| parts.all(|p| p.every.any(|c| Node.equal(c, e))))
+						Err(_) => []
+					}
+				{ all, every, empty: parts.any(|p| p.empty) }
+			} else {
+				{ all, every: [], empty: Bool.True }
+			}
+		}
+		_ => {
+			expr = item_expr(item)
+			{ all: [expr], every: [expr], empty: Bool.False }
+		}
+	}
 
 has_column_named : List(Rel), Str -> Bool
 has_column_named = |rels, name| rels.any(|r| visible_names(r).contains(name))
@@ -731,9 +762,10 @@ rel_column = |rel, column|
 	}
 
 ## The columns a `where` clause keeps only rows where they are not NULL:
-## the operand of `is not null`, and a column a comparison, `in`, `like`,
-## `similar` or `between` reads directly, in conditions joined by `and`.
-## Those operators are NULL for a NULL operand, which `where` drops.
+## the operand of `is not null`, and a column a comparison, `= any`, `in`,
+## `like`, `similar` or `between` reads directly, in conditions joined by
+## `and`. Those operators are NULL for a NULL operand, which `where` drops.
+## Not `all`, which is true for an empty array whatever it compares.
 not_null_refs : Node -> List(Node.ColumnRef)
 not_null_refs = |node| {
 	direct = |operands|
@@ -750,7 +782,7 @@ not_null_refs = |node| {
 		AExpr(a) =>
 			if a.kind == Enums.aexpr_op and comparison_ops.contains(op_name(a)) {
 				direct([a.lexpr, a.rexpr])
-			} else if [Enums.aexpr_op_any, Enums.aexpr_op_all, Enums.aexpr_in, Enums.aexpr_like, Enums.aexpr_ilike, Enums.aexpr_similar].contains(a.kind) {
+			} else if [Enums.aexpr_op_any, Enums.aexpr_in, Enums.aexpr_like, Enums.aexpr_ilike, Enums.aexpr_similar].contains(a.kind) {
 				direct([a.lexpr])
 			} else if a.kind >= Enums.aexpr_between and a.kind <= Enums.aexpr_not_between_sym {
 				direct([a.lexpr])
@@ -790,6 +822,10 @@ visible_names = |rel| known_list(rel.columns).map(|c| c.name).drop_if(|name| rel
 unknown_output : Check.Output
 unknown_output = { name: "?column?", type: Unknown, nullable: Unknown }
 
+## A row constructor, which is never NULL itself.
+row_output : Check.Output
+row_output = { ..unknown_output, name: "row", nullable: No }
+
 ## The problems in an expression. See [Typed].
 expression_problems : Node, List(Rel), Env -> List(Str)
 expression_problems = |node, rels, env| typed(node, rels, env).problems
@@ -797,14 +833,23 @@ expression_problems = |node, rels, env| typed(node, rels, env).problems
 ## Walk an expression once. The name in its output is the one Postgres
 ## gives a result column that has no alias.
 typed : Node, List(Rel), Env -> Typed
-typed = |node, rels, env| {
-	walked = walk(node, rels, env)
+typed = |node, rels, env| grouped_by(walk(node, rels, env), node, env)
+
+## What the select's grouping makes of `node`, which the walk found
+## `walked`.
+grouped_by : Typed, Node, Env -> Typed
+grouped_by = |walked, node, env|
 	match env.group {
-		# An expression the select groups by may be read whole.
-		Group(g) if g.exprs.any(|e| Node.equal(e, node)) => { ..walked, ungrouped: [] }
+		# An expression the select groups by may be read whole. It is NULL in
+		# the rows of a grouping set that leaves it out.
+		Group(g) if g.exprs.any(|e| Node.equal(e, node)) =>
+			if g.partial.any(|e| Node.equal(e, node)) {
+				{ ..walked, output: { ..walked.output, nullable: Yes }, ungrouped: [] }
+			} else {
+				{ ..walked, ungrouped: [] }
+			}
 		_ => walked
 	}
-}
 
 walk : Node, List(Rel), Env -> Typed
 walk = |node, rels, env| {
@@ -889,7 +934,7 @@ walk = |node, rels, env| {
 			over({ name: "case", type: common_type(all), nullable }, children)
 		}
 		AArrayExpr(a) => over({ ..unknown_output, name: "array", nullable: No }, subs(a.elements))
-		RowExpr(r) => over({ ..unknown_output, name: "row", nullable: No }, subs(r.args))
+		RowExpr(r) => over(row_output, subs(r.args))
 		AExpr(a) => operator(a, rels, env)
 		BoolExpr(b) => {
 			args = subs(b.args)
@@ -998,16 +1043,31 @@ comparison_ops = ["=", "<>", "!=", "<", ">", "<=", ">="]
 ## [not] distinct from`.
 operator : Node.AExpr, List(Rel), Env -> Typed
 operator = |a, rels, env| {
+	# A row compares field by field, so what its fields can be decides.
+	operand = |node|
+		match node {
+			RowExpr(r) => {
+				fields = r.args.map(|arg| typed(arg, rels, env))
+				{ value: grouped_by(over(row_output, fields), node, env), fields: fields.map(|f| f.output) }
+			}
+			_ => {
+				value = typed(node, rels, env)
+				{ value, fields: [value.output] }
+			}
+		}
 	side = |node|
 		match node {
 			Null => []
-			NodeList(items) => items.map(|item| typed(item, rels, env))
-			other => [typed(other, rels, env)]
+			NodeList(items) => items.map(operand)
+			other => [operand(other)]
 		}
-	lefts = side(a.lexpr)
-	rights = side(a.rexpr)
+	left_sides = side(a.lexpr)
+	right_sides = side(a.rexpr)
+	lefts = left_sides.map(|o| o.value)
+	rights = right_sides.map(|o| o.value)
 	operands = lefts.concat(rights)
 	outputs = operands.map(|o| o.output)
+	fields = left_sides.concat(right_sides).fold([], |acc, o| acc.concat(o.fields))
 	comparison = comparison_ops.contains(op_name(a))
 	# A comparison is boolean whatever operator it picks, so the pick is
 	# only needed to refuse one that nothing takes.
@@ -1019,9 +1079,13 @@ operator = |a, rels, env| {
 		} else if a.kind == Enums.aexpr_distinct or a.kind == Enums.aexpr_not_distinct {
 			# is [not] distinct from
 			{ ..unknown_output, type: Known("boolean"), nullable: No }
+		} else if a.kind == Enums.aexpr_op_any or a.kind == Enums.aexpr_op_all {
+			# An array can hold NULLs, which make the answer NULL when nothing
+			# else decides it.
+			{ ..unknown_output, type: Known("boolean"), nullable: Unknown }
 		} else if a.kind != Enums.aexpr_op or comparison {
-			# Comparisons, any/all, in, like, similar and between.
-			{ ..unknown_output, type: Known("boolean"), nullable: all_not_null(outputs) }
+			# Comparisons, in, like, similar and between.
+			{ ..unknown_output, type: Known("boolean"), nullable: all_not_null(fields) }
 		} else {
 			match choice {
 				Ok(c) => { ..unknown_output, type: c.result, nullable: operator_nullable(c, outputs, env) }
@@ -1599,11 +1663,33 @@ target_rel = |node, env|
 		_ => { rel: { alias: "?", table: "?", columns: Unknown, nullable: Bool.False, hidden: [], not_null: [] }, problems: [] }
 	}
 
-returning_list : Node, List(Rel), Env -> Check.Result
-returning_list = |node, rels, env|
+## A `returning` list over `rels`, the first of which is the target. `old`
+## and `new`, or the names `with (old as o, new as n)` gives them, are the
+## target's row before and after: NULL for a row that was not there
+## before, as an insert's, or is not after, as a delete's.
+returning_list : Node, List(Rel), { old_absent : Bool, new_absent : Bool }, Env -> Check.Result
+returning_list = |node, rels, absent, env|
 	match node {
 		ReturningClause(r) => {
-			{ outputs, problems, .. } = target_list(r.exprs, rels, env)
+			named = |option, default|
+				r.options.keep_oks(
+					|o|
+						match o {
+							ReturningOption(ro) if ro.option == option => ro.value.map_err(|_| NoName)
+							_ => Err(NoName)
+						},
+				).first() ?? default
+			versions =
+				match rels.first() {
+					Ok(target) => [
+						{ ..target, alias: named(Enums.returning_option_old, "old"), nullable: absent.old_absent, not_null: [] },
+						{ ..target, alias: named(Enums.returning_option_new, "new"), nullable: absent.new_absent, not_null: [] },
+					]
+					Err(_) => []
+				}
+			# Only a qualified reference or `old.*` reads them, as one reads the
+			# relations of an outer query.
+			{ outputs, problems, .. } = target_list(r.exprs, rels, { ..env, outer: versions.concat(env.outer) })
 			{ outputs, problems }
 		}
 		_ => { outputs: Known([]), problems: [] }
@@ -1783,9 +1869,9 @@ merge_stmt = |s, env| {
 				MergeWhenClause(w) => {
 					condition = expression_problems(w.condition, all, inner)
 					action =
-						if w.command_type == 2 {
+						if w.command_type == Enums.cmd_update {
 							set_problems(w.target_list, target, all, inner)
-						} else if w.command_type == 3 {
+						} else if w.command_type == Enums.cmd_insert {
 							merge_insert_problems(w, target, source, inner)
 						} else {
 							[]
@@ -1795,7 +1881,18 @@ merge_stmt = |s, env| {
 				_ => acc
 			},
 	)
-	returning = returning_list(s.returning_clause, all, inner)
+	clauses = s.merge_when_clauses.keep_oks(
+		|clause|
+			match clause {
+				MergeWhenClause(w) => Ok(w)
+				_ => Err(NotAClause)
+			},
+	)
+	# A target row no source row matches has no source columns.
+	by_source = clauses.any(|w| w.match_kind == Enums.merge_when_not_matched_by_source)
+	returned = [target].concat(if by_source source.map(|r| { ..r, nullable: Bool.True, not_null: [] }) else source)
+	absent = { old_absent: clauses.any(|w| w.command_type == Enums.cmd_insert), new_absent: clauses.any(|w| w.command_type == Enums.cmd_delete) }
+	returning = returning_list(s.returning_clause, returned, absent, inner)
 	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(source_problems).concat(join_problems).concat(clause_problems).concat(returning.problems) }
 }
 
@@ -1867,7 +1964,9 @@ insert_stmt = |s, env| {
 			OnConflictClause(c) => set_problems(c.target_list, target, [target, excluded], inner).concat(expression_problems(c.where_clause, [target, excluded], inner))
 			_ => []
 		}
-	returning = returning_list(s.returning_clause, [target], inner)
+	# An insert has no row before. `on conflict do update` does, but only
+	# for the rows it updates.
+	returning = returning_list(s.returning_clause, [target], { old_absent: Bool.True, new_absent: Bool.False }, inner)
 	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(column_problems).concat(shape_problems).concat(source_problems).concat(conflict_problems).concat(returning.problems) }
 }
 
@@ -1902,7 +2001,7 @@ update_stmt = |s, env| {
 	all = [target].concat(rels)
 	assignment_problems = set_problems(s.target_list, target, all, inner)
 	where_problems = expression_problems(s.where_clause, all, inner)
-	returning = returning_list(s.returning_clause, all, inner)
+	returning = returning_list(s.returning_clause, all, { old_absent: Bool.False, new_absent: Bool.False }, inner)
 	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(from_problems).concat(assignment_problems).concat(where_problems).concat(returning.problems) }
 }
 
@@ -1913,7 +2012,7 @@ delete_stmt = |s, env| {
 	{ rels, problems: using_problems } = from_list(s.using_clause, inner)
 	all = [target].concat(rels)
 	where_problems = expression_problems(s.where_clause, all, inner)
-	returning = returning_list(s.returning_clause, all, inner)
+	returning = returning_list(s.returning_clause, all, { old_absent: Bool.False, new_absent: Bool.True }, inner)
 	{ outputs: returning.outputs, problems: with_problems.concat(table_problems).concat(using_problems).concat(where_problems).concat(returning.problems) }
 }
 
@@ -2123,3 +2222,27 @@ expect outputs("merge into schools o using students r on o.id = r.school_id when
 
 # Each node is read once, so a long expression costs no more than its length.
 expect outputs("select ${Str.join_with(List.repeat("id", 20), " + ")} as x, coalesce(${Str.join_with(List.repeat("phone", 20), " || ")}, '') as y from students") == ["x integer", "y text"]
+
+# NULL that a row, an array or an empty array can bring.
+expect outputs("select id = any(array[1]) as a, (id, school_id) = (1, 2) as b, (id, phone) = (1, 'x') as c from students") == ["a boolean null?", "b boolean", "c boolean null?"]
+expect outputs("select phone from students where phone = any(array['x'])") == ["phone text"]
+expect outputs("select phone from students where phone <> all(array['x'])") == ["phone text null"]
+
+# Grouping sets: a column some set leaves out is NULL in that set's rows,
+# and with an empty set the aggregates can see no rows.
+expect outputs("select school_id, count(*) as n from students group by rollup(school_id)") == ["school_id integer null", "n bigint"]
+expect outputs("select school_id, sum(id) as s from students group by grouping sets ((school_id), ())") == ["school_id integer null", "s bigint null"]
+expect outputs("select school_id, name from students group by grouping sets ((school_id), (name))") == ["school_id integer null", "name text null"]
+expect outputs("select school_id, name, count(*) as n from students group by school_id, rollup(name)") == ["school_id integer", "name text null", "n bigint"]
+expect problems("select school_id, name from students group by rollup(school_id)") == ["column `name` must appear in `group by` or be used in an aggregate"]
+expect problems("select school_id, name from students group by grouping sets ((school_id), (name))") == []
+expect problems("select o.id, o.name from schools o group by rollup(o.id)") == ["column `o.name` must appear in `group by` or be used in an aggregate"]
+expect problems("select o.id, o.name from schools o group by o.id, rollup(o.name)") == []
+
+# `old` and `new` in a `returning` list, and a merge's unmatched rows.
+expect outputs("update students set phone = $p where id = $id returning old.phone as before, new.name as after") == ["before text null", "after text"]
+expect outputs("delete from students where id = $id returning old.name as n, new.name as m") == ["n text", "m text null"]
+expect outputs("insert into schools (id, name) values ($i, $n) returning old.name as o, new.name as n, name") == ["o text null", "n text", "name text"]
+expect outputs("update schools set name = $n where id = $i returning with (old as before) before.name as was, before.*") == ["was text", "id integer", "name text"]
+expect outputs("merge into schools o using students r on r.school_id = o.id when matched then update set name = r.name returning r.name as student") == ["student text"]
+expect outputs("merge into schools o using students r on r.school_id = o.id when not matched by source then delete returning r.name as student") == ["student text null"]
