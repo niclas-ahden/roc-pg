@@ -22,7 +22,7 @@ main! = |_| {
 	db : Client.Client(Tcp.Stream, Schema)
 	db = Client.connect_url!("some-database-url", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
 
-	planets = db.query!("SELECT id, name FROM planets WHERE gravity = $gravity", { gravity: 9.80665 })?
+	planets = db.query!("SELECT id, name FROM planets", {})?
 
 	for planet in planets {
 		Stdout.line!("${planet.name} (#${I32.to_str(planet.id)})")?
