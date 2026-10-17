@@ -28,7 +28,7 @@ main! = |_args| {
 	run!("roc", ["test", "package/main.roc"])?
 
 	Stdout.line!("== check examples and tests")?
-	for file in ["examples/query.roc", "examples/prepared.roc", "examples/webserver.roc", "examples/small/main.roc", "examples/rebellion/main.roc", "tests/integration.roc", "tests/typed.roc", "tests/concurrent/server.roc"] {
+	for file in ["examples/minimal/main.roc", "examples/query.roc", "examples/prepared.roc", "examples/webserver.roc", "examples/small/main.roc", "examples/rebellion/main.roc", "tests/integration.roc", "tests/typed.roc", "tests/concurrent/server.roc"] {
 		check!(file)?
 	}
 

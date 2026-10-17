@@ -1,32 +1,61 @@
-# roc-pg-insane-in-the-membrane
+# roc-pg
 
-A PostgreSQL client for Roc that checks every SQL query when the app compiles. When I say check, I mean _really_ checks: it has a complete parser from Postgres 18, so it can detect all sorts of issues. It also ingests a schema dump from your app so that it knows your complete database layout. omg.
-
-The checking works, but it's not fast. Two examples measure and profile that, on my machine, with Roc `7d7b432` and a cold cache:
-
-- [examples/small](examples/small/) is one table and 20 queries. `roc check` takes about 9 seconds and 5 GB of memory, and `roc build` about 63 seconds and 9 GB.
-- [examples/rebellion](examples/rebellion/) is sized like a real production app. `roc check` takes about 24 seconds and 10 GB.
-
-An app that runs only unchecked queries pays none of that: the parser is compiled only for an app that checks a query.
+A PostgreSQL client for Roc that checks every SQL query when the app compiles. When I say check, I mean _really_ checks: it has a complete parser from Postgres 18, so it can detect all sorts of issues. It also ingests a schema dump from your app so that it knows your complete database layout.
 
 ## What's it look like?
 
 ```roc
+app [main!] {
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
+	pg: "../../package/main.roc",
+}
+
+import pf.Stdout
+import pf.Tcp
+import pf.Random
+import pg.Client
+import pg.Catalog
 import "schema.sql" as schema_sql : Str
 
-parsed_schema = Catalog.from_schema(schema_sql)
+catalog : Catalog
+catalog = Catalog.from_schema(schema_sql)
 
-Schema := [].{ catalog = |{}| parsed_schema }
+Schema := [].{
+	catalog : {} -> Catalog
+	catalog = |{}| catalog
+}
 
-Db : Client.Client(Tcp.Stream, Schema)
+main! = |_| {
+	db : Client.Client(Tcp.Stream, Schema)
+	db = Client.connect_url!("some-database-url", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
 
-moons! : I32, Db => Try(List({ id : I32, name : Str }), _)
-moons! = |planet_id, db|
-	db.query!("SELECT id, name FROM moons WHERE planet_id = $planet_id ORDER BY name", { planet_id, })
+	planets = db.query!("SELECT id, name FROM planets WHERE gravity = $gravity", { gravity: 9.80665 })?
+
+	for planet in planets {
+		Stdout.line!("${planet.name} (#${I32.to_str(planet.id)})")?
+	}
+
+	db.close!()
+
+	Ok({})
+}
 ```
-Isn't that sweet? Real SQL, but with named arguments (who doesn't want that?), and low friction but high type safety.
+Isn't that sweet? Real SQL, but with named arguments (who doesn't want that?), and high type safety without ceremony.
 
-The compiler checks a query through its type alone, so the schema rides on a type, `Schema`. Keep the parsed dump in a top-level constant as above: parsing it inside `catalog` would parse it again for every query.
+What you get back is Roc records with the columns you asked for, with the correct types.
+
+## How does it work?
+
+It uses the Roc compiler's ability to parse strings at compile-time, and takes it quite far: it has a full PostgreSQL parser so that it understands your queries and schema as well as Postgres itself does.
+
+You dump your database schema to a file, like `schema.sql`, and import that in your Roc program (see example above). When you migrate your database you dump the schema again to keep it updated (this is easily done with `pg_dump` but there'll be even easier tooling later!)
+
+Since this is "just" parsing strings, `roc-pg` can give fast and correct feedback without ever having to connect to your database.
+
+## How does it compare to X?
+
+- Similar to [`sqlx`](https://github.com/transact-rs/sqlx), but it doesn't connect to your database to check queries. It just parses your files on disk.
+- Similar to [`sqlc`](https://github.com/sqlc-dev/sqlc), but it doesn't generate code. You just run your queries and use the records you get back.
 
 ## What do we get?
 
@@ -70,9 +99,9 @@ It returned this error message:
 
 Does it get any better than this?
 
-## Telling the checker more
+## When the SQL isn't definitive
 
-The checker never promises more than it can prove. A column it can't prove is `NOT NULL` needs a `Try(T, [Null])` field, just like one that can be NULL, so a NULL never turns into a decode error at runtime. When you know better, say so in the SQL, in a way the checker can see.
+The checker never promises more than it can prove. A column it can't prove is `NOT NULL` needs a `Try(T, [Null])` field, just like one that can be NULL, so a NULL never turns into a decode error at runtime. You can always help the checker to prove what you know:
 
 **NULL.** These show that a value is not NULL:
 
@@ -96,7 +125,7 @@ The checker never promises more than it can prove. A column it can't prove is `N
 | `real` | `F32`, `F64` |
 | `double precision` | `F64` |
 
-Postgres has no unsigned integers, and no 8-bit ones. For a `U8`, `U16`, `U32`, `U64` or `I8`, make a domain that bounds its values, and use it as the column's type:
+Postgres has no unsigned integers, and no 8-bit ones. If you really want a `U8`, `U16`, `U32`, `U64` or `I8`, make a domain that bounds its values, and use it as the column's type:
 
 ```sql
 CREATE DOMAIN u8 AS smallint CHECK (VALUE BETWEEN 0 AND 255);
@@ -140,92 +169,31 @@ A checked query whose result has two columns named after one field fails with `D
 
 ## Getting started
 
-Use Roc `7d7b432` (there's a flake if you're using Nix). Then step into one of the examples, `small` for a quick loop or `rebellion` for the full size:
+Use the Roc version that's recommended in the `roc-pg` release you're using (it says in the release notes) or our Nix flake. Then step into one of the examples, `minimal`, and
 
 ```sh
-cd examples/small
+cd examples/minimal
 ```
 
 Check the app:
 
 ```sh
-time roc check main.roc
+roc check main.roc
 ```
 
 Build it:
 
 ```sh
-time roc build main.roc --output=app
+roc build main.roc --output=app
 ```
 
 ## Examples
 
-### small
-
-[main.roc](examples/small/main.roc) has 20 queries over the `planets` table of a one-table [schema.sql](examples/small/schema.sql). Each query returns its own 8-field record: `id`, `name` and a different run of six more columns. Everything else is the same in every query, so it isolates the cost of row types (see [Where the time goes](#where-the-time-goes)).
-
-### rebellion
-
-`rebellion` is a large example modeled after a real production web app to make it realistic.
-
-- [schema.sql](examples/rebellion/schema.sql) is the `pg_dump --schema-only` the queries are checked against, followed by a data dump of `schema_migrations`, as a Rails app's dump looks.
-- [Schema.roc](examples/rebellion/Schema.roc) reads it into the catalog.
-- Each area of the database has a module with its queries: `Galaxy.roc`, `Personnel.roc`, `Fleet.roc`, `Missions.roc` and nine more. Most queries are short lookups by key. There are also wide detail views, reports with CASE, coalesce and scalar subqueries, `UPDATE`s with up to 26 parameters, `INSERT`s, upserts and a few `DELETE`s. Each query has its own row type, as in a real app.
-- [main.roc](examples/rebellion/main.roc) dispatches to each module's `run!`, which gives every query a command, such as `rebellion <database url> galaxy planet Hoth`. A query is only checked when `main!` can reach it, so a query without a command would not be part of the measurement.
-
-## Build times
-
-Measured on an AMD 9950X, 32 core machine with Roc `7d7b432`, from a cold cache:
-
-| App | Command | Time and peak memory |
-|-----|---------|----------------------|
-| `small` | `roc check` | 9 s, 4.9 GB |
-| `small` | `roc build` | 63 s, 9.0 GB |
-| `rebellion` | `roc check` | 23 to 26 s, 9.7 GB |
-| [examples/query.roc](examples/query.roc), unchecked queries only | `roc check` | 0.23 s, 0.28 GB |
-| [examples/query.roc](examples/query.roc), unchecked queries only | `roc build` | 4.1 s, 0.66 GB |
-
-For comparison, the real app rebellion is modeled on builds in about 7 seconds on [roc-pg](https://github.com/niclas-ahden/roc-pg), which does not check queries.
-
-### Where the time goes
-
-Measured with Roc `b797cda`, before the numbers above:
-
-**A fixed cost for the parser.** The first checked query adds about 6 seconds, when the compiler lowers the parser and the analysis for compile-time evaluation. An app without a checked query doesn't compile the parser at all. Earlier profiling found three hotspots, each growing with the size of the 222-variant `Node` type of the parse tree:
-
-- The exhaustiveness check of every `match` on `Node` is quadratic in the number of variants.
-- Every construction `Node.C(...)` rebuilds the union. `Actions.roc` has about 4,700 of them.
-- Monotype lowering spends most of its time in interface relations.
-
-**A cost for each row type, in `roc build` only.** Every distinct row type adds build time in proportion to its number of fields. These apps have 20 queries each against the rebellion schema:
-
-| Each query returns | `roc build` |
-|--------------------|-------------|
-| The same 2-field row type | 35 s |
-| Its own 2-field row type | 49 s |
-| Its own 8-field row type | 96 s |
-| Its own 8-field row type, without a schema (`NoSchema`) | 96 s |
-
-That is about 0.4 seconds for each field of each distinct row type, whether or not there is a schema. The same 20 queries check in about 26 seconds either way. `small` shows the same at a realistic mix of column types: 130 seconds with a row type for each query, 46 seconds when they all share one. rebellion has 212 distinct row types, many of them wide, which is most likely why its build takes more than 30 minutes.
+Start with [the minimal example](examples/minimal/main.roc) which shows how to use `roc-pg`. The other examples (`small`, and `rebellion`) are mainly for performance optimizations of the Roc compiler and `roc-pg` itself.
 
 ## Not supported
 
 - `LISTEN` and `NOTIFY`. A session can run them, but the client never delivers a notification. It reads past any that arrive.
-
-## Structure
-
-- `Scan.roc` (a port of Postgres's lexer) and `Parse.roc` (Postgres's parser loop, driven by the tables in `Grammar.roc`) parse the SQL. `Actions.roc` builds the parse tree out of `Node.roc`'s types, one function per rule of `gram.y`.
-- `Dump.roc` reads `schema.sql`, with the same parser. `Catalog.roc` wraps it for apps, and its `check` runs everything a checked query is checked for.
-- `Check.roc` walks the tree against the dump in one pass, bottom up: tables, columns, parameters, row fields, NULL. `Overload.roc` picks functions and operators by argument types, and finds the type values share, using the built in types and functions in `Builtins.roc`.
-- `PgType.roc` says which Roc types hold which Postgres types' values, both for the build and when a query runs.
-- `Sql.roc` is the type of a checked query. It reaches the checker only through the schema type's catalog, so `Client.roc` and an app with only unchecked queries never compile the parser.
-
-`Grammar.roc`, `Node.roc`, `Enums.roc`, `Actions.roc`, `Keywords.roc` and `Builtins.roc` are generated from Postgres's sources by the programs in `tools/`.
-
-When changing or regenerating code, follow the
-[code-generation guidelines](docs/code-generation-guidelines.md). They explain
-the representation, reuse, correctness, and measurement principles behind the
-generated-action cleanup, with a checklist for future generation agents.
 
 ## Tests
 
