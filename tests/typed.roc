@@ -37,13 +37,9 @@ schema_sql =
 	\\CREATE DOMAIN public.typed_u8 AS smallint CHECK (VALUE BETWEEN 0 AND 255);
 	\\CREATE TABLE public.typed_pixels (red public.typed_u8 NOT NULL);
 
-catalog : Catalog
-catalog = Catalog.from_schema(schema_sql)
+parsed_schema = Catalog.from_schema(schema_sql)
 
-Schema := [].{
-	catalog : {} -> Catalog
-	catalog = |{}| catalog
-}
+Schema := [].{ catalog = |{}| parsed_schema }
 
 Db : Client.Client(Tcp.Stream, Schema)
 

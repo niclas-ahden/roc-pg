@@ -18,13 +18,9 @@ import pg.Client
 import pg.Catalog
 import "schema.sql" as schema_sql : Str
 
-catalog : Catalog
-catalog = Catalog.from_schema(schema_sql)
+parsed_schema = Catalog.from_schema(schema_sql)
 
-Schema := [].{
-	catalog : {} -> Catalog
-	catalog = |{}| catalog
-}
+Schema := [].{ catalog = |{}| parsed_schema }
 
 Db : Client.Client(Tcp.Stream, Schema)
 

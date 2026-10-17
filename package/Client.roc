@@ -46,6 +46,8 @@
 ## - `Client.query!`, `Client.query_one!`, `Client.query_optional!` and
 ##   `Client.execute!` run queries that are checked when you build.
 ## - `Client.transaction!` runs several statements as one transaction.
+## - `Client.verify_schema!` checks at startup that the database still
+##   matches the schema the queries were checked against.
 ## - `Client.query_unchecked!` and the other `_unchecked` functions run SQL
 ##   you build at runtime.
 ## - `Client.batch_execute_unchecked!` runs several statements separated by
@@ -290,8 +292,9 @@ Client(stream, schema) :: {
 	## the `write!` and `read_exactly!` that [Client.connect!] calls. They
 	## drop the timeout, and the platform's own applies instead. See
 	## [Client.fixed_timeout].
-	# Transparent, although nothing outside needs its field: made opaque
-	# (`::`), it segfaults `roc check` on examples/webserver.roc at b797cda.
+	# Transparent, although nothing outside needs its field. Its methods are
+	# unannotated, since the stream's own vary by platform, and at 7d7b432
+	# such methods of an opaque (`::`) type do not type check.
 	FixedTimeout(stream) := { stream : stream }.{
 		write! = |fixed, bytes, _timeout_ms| fixed.stream.write!(bytes)
 		read_exactly! = |fixed, len, _timeout_ms| fixed.stream.read_exactly!(len)
@@ -314,7 +317,7 @@ Client(stream, schema) :: {
 	## the platform's timeout fails with `PgReadErr`. Set a shorter
 	## `statement_timeout` on the role, which fails such a statement with
 	## `PgErr` instead and leaves the connection usable. The client's type is
-	## `Client.Client(Client.FixedTimeout(Tcp.Stream))`.
+	## `Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)`.
 	fixed_timeout : (Str, U16 => Try(stream, err)) -> (Str, U16, U64 => Try(Client.FixedTimeout(stream), err))
 	fixed_timeout = |dial!|
 		|host, port, _timeout_ms|

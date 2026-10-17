@@ -25,13 +25,9 @@ schema_sql =
 	\\    name text NOT NULL
 	\\);
 
-catalog : Catalog
-catalog = Catalog.from_schema(schema_sql)
+parsed_schema = Catalog.from_schema(schema_sql)
 
-Schema := [].{
-	catalog : {} -> Catalog
-	catalog = |{}| catalog
-}
+Schema := [].{ catalog = |{}| parsed_schema }
 
 Db : Client.Client(Tcp.Stream, Schema)
 
