@@ -3,8 +3,8 @@
 ## grammar, the grammar's token numbers, and the length and left-hand side
 ## of each rule.
 ##
-## It needs the Postgres source in `local/` (see PARSER.md) and
-## bison on the path:
+## It needs the Postgres 18.6 source in `local/postgres-18.6`, from
+## `nix build nixpkgs#postgresql_18.src`, and bison on the path:
 ##
 ##     nix shell nixpkgs#bison -c roc tools/grammar.roc
 ##

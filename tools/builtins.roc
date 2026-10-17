@@ -4,7 +4,8 @@
 ## is built from, for typing function calls and operators the way the
 ## server does.
 ##
-## It needs the Postgres source in `local/` (see PARSER.md):
+## It needs the Postgres 18.6 source in `local/postgres-18.6`, from
+## `nix build nixpkgs#postgresql_18.src`:
 ##
 ##     roc tools/builtins.roc
 ##
