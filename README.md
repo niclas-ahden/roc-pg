@@ -52,6 +52,38 @@ You dump your database schema to a file, like `schema.sql`, and import that in y
 
 Since this is "just" parsing strings, `roc-pg` can give fast and correct feedback without ever having to connect to your database.
 
+## Getting started
+
+Use the Roc version that's recommended in the `roc-pg` release you're using (it says in the release notes) or our Nix flake. Then step into one of the examples, `minimal`, and
+
+```sh
+cd examples/minimal
+```
+
+Check the app:
+
+```sh
+roc check main.roc
+```
+
+Build it:
+
+```sh
+roc build main.roc --output=app
+```
+
+For your own app, dump your database's schema next to `main.roc` and import it as in [the example above](#whats-it-look-like):
+
+```sh
+pg_dump --schema-only --no-owner mydb > schema.sql
+```
+
+Dump it again after each migration so the checks match the database. We'll provide tooling for this later.
+
+## Examples
+
+Start with [the minimal example](examples/minimal/main.roc) which shows how to use `roc-pg`. The other examples (`small`, and `rebellion`) are mainly for performance optimizations of the Roc compiler and `roc-pg` itself.
+
 ## How does it compare to X?
 
 There are many great Postgres clients and these are some similar ones:
@@ -286,30 +318,6 @@ If you use [PgBouncer](https://www.pgbouncer.org) in transaction mode:
 - [PgBouncer](https://www.pgbouncer.org) refuses startup parameters it does not know, so set `statement_timeout` on the role (`alter role my_app set statement_timeout = '30s'`) rather than with `statement_timeout_ms`, and leave settings other than `application_name` out of `params`.
 - Named prepared statements (`prepare_unchecked!`) need [PgBouncer](https://www.pgbouncer.org) 1.21 or later with `max_prepared_statements` set. `query!`, `execute!` and the rest use unnamed statements and need nothing.
 - Session state (`set`, session advisory locks, temp tables) does not last from one transaction to the next. Use `set local` inside a transaction.
-
-## Getting started
-
-Use the Roc version that's recommended in the `roc-pg` release you're using (it says in the release notes) or our Nix flake. Then step into one of the examples, `minimal`, and
-
-```sh
-cd examples/minimal
-```
-
-Check the app:
-
-```sh
-roc check main.roc
-```
-
-Build it:
-
-```sh
-roc build main.roc --output=app
-```
-
-## Examples
-
-Start with [the minimal example](examples/minimal/main.roc) which shows how to use `roc-pg`. The other examples (`small`, and `rebellion`) are mainly for performance optimizations of the Roc compiler and `roc-pg` itself.
 
 ## Limitations
 
