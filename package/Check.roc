@@ -599,52 +599,137 @@ from_item = |node, env|
 			result = statement(r.subquery, env)
 			{ rels: [aliased("(subquery)", result.outputs, r.alias)], problems: result.problems }
 		}
-		RangeFunction(r) => {
-			calls = r.functions.fold(
-				[],
-				|acc, f|
-					match f {
-						NodeList(parts) => acc.concat(parts.take_first(1))
-						_ => acc
-					},
-			)
-			name =
-				match calls.first() {
-					Ok(FuncCall(call)) => names_of(call.funcname).last() ?? "?"
-					_ => "?"
-				}
-			walked = calls.map(
+		RangeFunction(r) => range_function(r, env)
+		RangeTableSample(t) => {
+			sampled = from_item(t.relation, env)
+			{ ..sampled, problems: sampled.problems.concat(t.args.concat([t.repeatable]).fold([], |acc, e| acc.concat(expression_problems(e, [], env)))) }
+		}
+		RangeTableFunc(t) => {
+			# xmltable(...): its columns are declared, NULL unless `not null`.
+			columns = t.columns.keep_oks(
 				|c|
 					match c {
-						FuncCall(f) => call(f, [], env)
-						other => { typed: typed(other, [], env), choice: Err(NoChoice) }
+						RangeTableFuncCol(col) =>
+							Ok(
+								if col.for_ordinality {
+									{ name: col.colname ?? "", type: Known("integer"), nullable: No }
+								} else {
+									{ name: col.colname ?? "", type: type_of(col.type_name), nullable: if col.is_not_null No else Yes }
+								},
+							)
+						_ => Err(NotAColumn)
 					},
 			)
-			problems = walked.fold([], |acc, w| acc.concat(w.typed.problems))
-			# One function that returns a type of one column gives one column,
-			# named after the alias, or the function without one.
-			columns =
-				match walked {
-					[only] if !r.ordinality =>
-						match only.choice {
-							Ok({ outputs: [_, ..] as outputs, .. }) => Known(outputs.map(|o| { name: o.name, type: Known(o.type), nullable: Unknown }))
-							Ok({ result: Known(type), .. }) if Overload.category(type, env.enums) != 'C' => {
-								column =
-									match r.alias {
-										Alias(a) => a.aliasname ?? name
-										_ => name
-									}
-								Known([{ name: column, type: Known(type), nullable: Unknown }])
-							}
-							_ => Unknown
-						}
-					_ => Unknown
-				}
-			{ rels: [aliased(name, columns, r.alias)], problems }
+			exprs = [t.docexpr, t.rowexpr].concat(t.namespaces).concat(
+				t.columns.fold(
+					[],
+					|acc, c|
+						match c {
+							RangeTableFuncCol(col) => acc.concat([col.colexpr, col.coldefexpr])
+							_ => acc
+						},
+				),
+			)
+			{ rels: [aliased("xmltable", Known(columns), t.alias)], problems: exprs.fold([], |acc, e| acc.concat(expression_problems(e, [], env))) }
+		}
+		JsonTable(j) => {
+			problems = [j.context_item].concat(j.passing).fold([], |acc, e| acc.concat(expression_problems(e, [], env)))
+			{ rels: [aliased("json_table", Known(json_table_columns(j.columns)), j.alias)], problems }
 		}
 		JoinExpr(j) => join(j, env)
-		_ => { rels: [], problems: [] }
+		# A relation this does not read still has a name, and columns that
+		# are not known.
+		_ => { rels: [{ alias: "?", table: "?", columns: Unknown, nullable: Bool.False, hidden: [], not_null: [] }], problems: [] }
 	}
+
+## A function in `from`, or several in `rows from (...)`. A function that
+## returns one column of a scalar type gives a column named after the
+## alias, or after the function without one. One that returns a record
+## takes its columns from a column definition list, `as t(a int, b text)`.
+## `with ordinality` adds a column that counts the rows.
+range_function : Node.RangeFunction, Env -> { rels : List(Rel), problems : List(Str) }
+range_function = |r, env| {
+	parts = r.functions.map(
+		|f|
+			match f {
+				NodeList([c, NodeList(defs), ..]) => (c, defs)
+				NodeList([c, ..]) => (c, [])
+				other => (other, [])
+			},
+	)
+	func_name = |node|
+		match node {
+			FuncCall(f) => names_of(f.funcname).last() ?? "?"
+			_ => "?"
+		}
+	name = parts.first().map_ok(|(c, _)| func_name(c)) ?? "?"
+	single = parts.len() == 1
+	walked = parts.map(
+		|(c, defs)| {
+			found =
+				match c {
+					FuncCall(f) => call(f, [], env)
+					other => { typed: typed(other, [], env), choice: Err(NoChoice) }
+				}
+			declared = if single and defs.is_empty() r.coldeflist else defs
+			columns =
+				if !declared.is_empty() {
+					Known(
+						declared.keep_oks(
+							|d|
+								match d {
+									ColumnDef(col) => Ok({ name: col.colname ?? "", type: type_of(col.type_name), nullable: Unknown })
+									_ => Err(NotAColumn)
+								},
+						),
+					)
+				} else {
+					match found.choice {
+						Ok({ outputs: [_, ..] as outputs, .. }) => Known(outputs.map(|o| { name: o.name, type: Known(o.type), nullable: Unknown }))
+						Ok({ result: Known(type), .. }) if Overload.category(type, env.enums) != 'C' => {
+							column =
+								match r.alias {
+									Alias(a) if single => a.aliasname ?? name
+									_ => func_name(c)
+								}
+							Known([{ name: column, type: Known(type), nullable: Unknown }])
+						}
+						_ => Unknown
+					}
+				}
+			{ columns, problems: found.typed.problems }
+		},
+	)
+	problems = walked.fold([], |acc, w| acc.concat(w.problems))
+	columns =
+		if walked.all(|w| w.columns != Unknown) {
+			counted = if r.ordinality [{ name: "ordinality", type: Known("bigint"), nullable: No }] else []
+			Known(walked.fold([], |acc, w| acc.concat(known_list(w.columns))).concat(counted))
+		} else {
+			Unknown
+		}
+	{ rels: [aliased(name, columns, r.alias)], problems }
+}
+
+## The columns of `json_table(... columns (...))`, those of nested paths
+## among them. A value the path does not find is NULL.
+json_table_columns : List(Node) -> List(Check.Output)
+json_table_columns = |columns|
+	columns.fold(
+		[],
+		|acc, c|
+			match c {
+				JsonTableColumn(col) =>
+					if col.coltype == Enums.jtc_nested {
+						acc.concat(json_table_columns(col.columns))
+					} else if col.coltype == Enums.jtc_for_ordinality {
+						acc.append({ name: col.name ?? "", type: Known("integer"), nullable: No })
+					} else {
+						acc.append({ name: col.name ?? "", type: type_of(col.type_name), nullable: if col.coltype == Enums.jtc_exists Unknown else Yes })
+					}
+				_ => acc
+			},
+	)
 
 ## A relation named `table`, or after its alias, with the alias's column
 ## names.
@@ -1013,6 +1098,7 @@ walk = |node, rels, env| {
 		ResTarget(t) => over(unknown_output, [sub(t.val)])
 		MultiAssignRef(m) => over(unknown_output, [sub(m.source)])
 		GroupingSet(g) => over(unknown_output, subs(g.content))
+		JsonValueExpr(v) => over(unknown_output, [sub(v.raw_expr)])
 		_ => leaf(unknown_output)
 	}
 }
@@ -2348,3 +2434,12 @@ expect outputs("values (1, 'a'), (2.5, null)") == ["column1 numeric", "column2 t
 expect problems("values (1), (2, 3)") == ["VALUES lists must all be the same length"]
 expect problems("values (1), ('x'), (true)") == ["VALUES types integer and boolean cannot be matched"]
 expect problems("select id from students where name in ('a', 1) and id not in (1, 2, $x) and id in (select school_id from students)") == ["operator `text = integer` does not exist"]
+
+# Relations of a `from` list besides tables and subqueries.
+expect outputs("select r.name from students r tablesample bernoulli (10)") == ["name text"]
+expect problems("select r.nmae from students r tablesample system (1) repeatable (7)") == ["column `r.nmae` does not exist in `students` (did you mean `name`?)"]
+expect outputs("select x.a, x.n from xmltable('/r' passing ('<r/>'::xml) columns a text path 'a', n for ordinality, b int not null) as x") == ["a text null", "n integer"]
+expect outputs("select j.id, j.tag, j.n from json_table('[]'::jsonb, '$[*]' columns (n for ordinality, id int path '$.id', nested path '$.tags[*]' columns (tag text path '$'))) as j") == ["id integer null", "tag text null", "n integer"]
+expect outputs("select t.a, t.b from json_to_record('{}'::json) as t(a int, b text)") == ["a integer null?", "b text null?"]
+expect outputs("select g, ordinality from generate_series(1, 3) with ordinality as g") == ["g integer null?", "ordinality bigint"]
+expect outputs("select a, b from rows from (generate_series(1, 2), unnest(array['x'])) as t(a, b)") == ["a integer null?", "b text null?"]
