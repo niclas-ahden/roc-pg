@@ -88,6 +88,8 @@ import Param
 import scram.Scram
 import PgResult
 import Sql
+import Interpolated
+import Tagged
 import PgType
 import ParamFormat
 import RowFormat
@@ -537,6 +539,40 @@ Client(stream, schema) :: {
 		Row : row
 		named = ParamFormat.encode(params, Params.encoder_for(ParamFormat.Text))?
 		result = run_checked!(client, Sql.text(sql), Sql.params(sql), Sql.fields(sql), Sql.unverified(sql), named)?
+		decode_rows(result, Row.parser_for(RowFormat.Text))
+	}
+
+	## Like `Client.query!`, with the parameters interpolated into the SQL
+	## (see [Interpolated]). The values of one query share a type, which is
+	## checked when you build.
+	##
+	## ```
+	## planets = db.query_interpolated!("select id, name from planets where age > ${min_age}")?
+	## ```
+	query_interpolated! : Client(_, schema), Interpolated.Interpolated(schema, row) => Try(List(row), Client.TypedErr(_, _, others))
+		where [
+			row.parser_for : RowFormat -> (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)),
+		]
+	query_interpolated! = |client, sql| {
+		Row : row
+		result = run_checked!(client, sql.text(), sql.params(), sql.fields(), sql.unverified(), sql.values())?
+		decode_rows(result, Row.parser_for(RowFormat.Text))
+	}
+
+	## Like `Client.query!`, with the parameters interpolated into the SQL as
+	## [Hole] values (see [Tagged]). The server checks their types when the
+	## query runs.
+	##
+	## ```
+	## planets = db.query_tagged!("select id, name from planets where age > ${5} and name <> ${Text(name)}")?
+	## ```
+	query_tagged! : Client(_, schema), Tagged.Tagged(schema, row) => Try(List(row), Client.TypedErr(_, _, others))
+		where [
+			row.parser_for : RowFormat -> (RowFormat.State -> Try({ value : row, rest : RowFormat.State }, RowFormat.Err)),
+		]
+	query_tagged! = |client, sql| {
+		Row : row
+		result = run_checked!(client, sql.text(), sql.params(), sql.fields(), sql.unverified(), sql.values())?
 		decode_rows(result, Row.parser_for(RowFormat.Text))
 	}
 

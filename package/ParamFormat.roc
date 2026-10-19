@@ -25,6 +25,17 @@ ParamFormat := [Text].{
 			Err(NestedParam(name)) => Err(NestedParam(name))
 		}
 
+	## One value that is not a record, such as an interpolated one, as a
+	## parameter.
+	encode_value : value, (value, ParamFormat.State -> Try(ParamFormat.State, ParamFormat.Err)) -> Try(Param.Param, ParamFormat.Err)
+	encode_value = |value, write| {
+		state = write(value, { params: [], name: "", depth: 1, in_list: Bool.False, items: [] })?
+		match state.params {
+			[(_, param)] => Ok(param)
+			_ => Err(ParamsNotARecord)
+		}
+	}
+
 	## The parameters in the order of the query's placeholders. `from_quote`
 	## has already checked that the record has a field for each of them.
 	bind : List(Str), List((Str, Param.Param)) -> List(Param.Param)

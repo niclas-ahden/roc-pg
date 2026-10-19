@@ -58,6 +58,21 @@ RowFormat := [Text, Nulls, Kinds].{
 		)
 	}
 
+	## The kind of a type that is not a record, such as an interpolated
+	## value's, from its parser in the `Nulls` and the `Kinds` mode. The
+	## field's `name` is empty.
+	value_shape : (RowFormat.State -> Try({ value : a, rest : RowFormat.State }, RowFormat.Err)), (RowFormat.State -> Try({ value : a, rest : RowFormat.State }, RowFormat.Err)) -> Try(RowFormat.Field, [NestedRecord])
+	value_shape = |parse_nulls, parse_kinds| {
+		# Started, so a record type fails at `parse_record_start`.
+		one = { ..initial, started: Bool.True, fields: [{ name: "", kind: "", nullable: Bool.False }] }
+		nulls = parse_nulls(one) ? |_| NestedRecord
+		kinds = parse_kinds(one) ? |_| NestedRecord
+		match (kinds.rest.fields.first(), nulls.rest.fields.first()) {
+			(Ok(field), Ok(null_field)) => Ok({ ..field, nullable: null_field.nullable })
+			_ => Err(NestedRecord)
+		}
+	}
+
 	rename_field : RowFormat, Str -> Str
 	rename_field = |_, name| name
 
