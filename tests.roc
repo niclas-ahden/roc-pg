@@ -7,14 +7,14 @@
 ##
 ##     nix develop -c ./tests.roc
 app [main!] {
-	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.26.0/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t.tar.zst",
 }
 
 import pf.Stdout
 import pf.Cmd
 import pf.Env
 import pf.Path
-import pf.Utc
+import pf.Monotonic
 import pf.OsStr
 
 pg_port = "5499"
@@ -91,7 +91,7 @@ main! = |_args| {
 ## files, cannot be fixed here, so it does not.
 check! : Str => Try({}, [Exit(I32)])
 check! = |file| {
-	output = Cmd.new_str("roc").args_str(["check", file]).stdout(Tee).stderr(Tee).run!() ? |_| Exit(1)
+	output = Cmd.new(OsStr.from_str("roc")).args(["check", file].map(OsStr.from_str)).stdout(Tee).stderr(Tee).run!() ? |_| Exit(1)
 	match output.status {
 		Exited(0) => Ok({})
 		Exited(2) => {
@@ -136,7 +136,7 @@ in_repo = |path| {
 # Run a command with inherited stdio, failing the script on a nonzero exit.
 run! : Str, List(Str) => Try({}, [Exit(I32)])
 run! = |program, arguments| {
-	Cmd.exec!(OsStr.from_str(program), arguments.map(OsStr.from_str)) ? |_| Exit(1)
+	Cmd.call!(OsStr.from_str(program), arguments.map(OsStr.from_str)) ? |_| Exit(1)
 	Ok({})
 }
 
@@ -173,14 +173,14 @@ concurrent! = |{}| {
 	run!("roc", ["build", "tests/concurrent/server.roc", "--output=${concurrent_dir}/server"])?
 
 	server =
-		Cmd.new_str("${concurrent_dir}/server")
-			.envs_str([
+		Cmd.new(OsStr.from_str("${concurrent_dir}/server"))
+			.envs([
 				("PG_HOST", "127.0.0.1"),
 				("PG_PORT", pg_port),
 				("PG_USER", pg_user),
 				("PG_DATABASE", pg_database),
 				("LISTEN_PORT", concurrent_port),
-			])
+			].map(|(name, value)| (OsStr.from_str(name), OsStr.from_str(value))))
 			.stdout(Null)
 			.stderr(Null)
 			.spawn!()
@@ -199,9 +199,9 @@ concurrent_checks! = |{}| {
 	run!("curl", ["--silent", "--fail", "--output", "/dev/null", "--retry", "100", "--retry-delay", "0", "--retry-connrefused", "--retry-max-time", "20", "${base}/0"])?
 
 	# One file per request, so each reply can be matched to its request.
-	started = Utc.now!()
+	started = Monotonic.now!()
 	run!("curl", ["--silent", "--parallel", "--parallel-immediate", "--parallel-max", concurrent_parallel.to_str(), "--output", "${concurrent_dir}/reply_#1.txt", "${base}/[1-${concurrent_requests.to_str()}]"])?
-	elapsed_ms = Utc.delta_as_millis(started, Utc.now!())
+	elapsed_ms = Monotonic.elapsed!(started).to_millis()
 
 	_ = collect_pids!(1, [])?
 	# One request after another would take the sleep of every one of them.
@@ -209,7 +209,7 @@ concurrent_checks! = |{}| {
 	# more than they need.
 	one_by_one_ms = concurrent_requests * concurrent_sleep_ms
 	Stdout.line!("${concurrent_requests.to_str()} requests took ${elapsed_ms.to_str()} ms, one by one they would take at least ${one_by_one_ms.to_str()} ms")?
-	if elapsed_ms > U64.to_u128(one_by_one_ms // 2) {
+	if elapsed_ms > one_by_one_ms // 2 {
 		Err(ConcurrentTestFailed("the requests never ran in parallel"))
 	} else {
 		Ok({})
@@ -264,11 +264,14 @@ expected_errors = [
 ## build does.
 compile_errors! : {} => Try({}, _)
 compile_errors! = |{}| {
-	outcome = Cmd.new_str("roc").args_str(["check", "tests/checked_sql_errors.roc"]).exec_output!()
+	outcome = Cmd.new(OsStr.from_str("roc")).args(["check", "tests/checked_sql_errors.roc"].map(OsStr.from_str)).run!()
 	output =
 		match outcome {
-			Ok(_) => return Err(CompileErrorsCompiled)
-			Err(NonZeroExitCode({ stdout_utf8_lossy, stderr_utf8_lossy, exit_code: _, command: _ })) => "${stdout_utf8_lossy}${stderr_utf8_lossy}"
+			Ok(ran) =>
+				match ran.status {
+					Exited(0) => return Err(CompileErrorsCompiled)
+					_ => "${ran.stdout_utf8_lossy()}${ran.stderr_utf8_lossy()}"
+				}
 			Err(_) => return Err(CompileErrorsDidNotRun)
 		}
 	# Every query must be rejected, each at its literal with its own

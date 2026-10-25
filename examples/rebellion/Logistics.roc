@@ -3,7 +3,7 @@ import pg.Client
 import Args
 import Schema
 
-Db : Client.Client(Tcp.Stream, Schema)
+Db : Client.Client(Tcp.Connection, Schema)
 
 Smuggler : {
 	id : I32,

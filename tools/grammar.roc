@@ -12,7 +12,7 @@
 ## so the tables cost a string literal at compile time and each lookup
 ## decodes one entry.
 app [main!] {
-	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.26.0/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t.tar.zst",
 }
 
 import pf.Stdout
@@ -35,7 +35,7 @@ main! : List(OsStr) => Try({}, _)
 main! = |_args| {
 	Path.create_all!(Path.utf8(out_dir))?
 	gram_y = "${pg_dir}/src/backend/parser/gram.y"
-	Cmd.exec!(OsStr.from_str("bison"), ["-Wnone", "-d", "-o", "${out_dir}/gram.c", gram_y].map(OsStr.from_str)) ? |_| BisonFailed
+	Cmd.call!(OsStr.from_str("bison"), ["-Wnone", "-d", "-o", "${out_dir}/gram.c", gram_y].map(OsStr.from_str)) ? |_| BisonFailed
 	c = Path.read_utf8!(Path.utf8("${out_dir}/gram.c"))?
 	h = Path.read_utf8!(Path.utf8("${out_dir}/gram.h"))?
 	kwlist = Path.read_utf8!(Path.utf8("${pg_dir}/src/include/parser/kwlist.h"))?

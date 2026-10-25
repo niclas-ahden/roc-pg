@@ -8,7 +8,7 @@
 ## assumed below (adjust it to yours). Run it with `roc examples/webserver.roc`,
 ## then `curl localhost:8000`.
 app [Context, program] {
-	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.18.0/9VgbC77zLmYYgxLpiNGCq3eySyRCbE2RriAM4sjr2y81.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.19.0/4KBAoiBazDfi9UF6e3BYKwon6rA8mnx3dbLMLKFzdEMw.tar.zst",
 	pg: "../package/main.roc",
 	http: "https://github.com/roc-lang/http/releases/download/2.0.0/6ZUwqYhCS8PU9Mo6MF7oV82ET2o7KYb57CLKDq4cq4sS.tar.zst",
 }

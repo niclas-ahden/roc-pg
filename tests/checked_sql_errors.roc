@@ -2,7 +2,7 @@
 ## and expects it to fail with every message listed in `expected_errors` of
 ## tests.roc, each at its query literal.
 app [main!] {
-	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.26.0/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t.tar.zst",
 	pg: "../package/main.roc",
 }
 
