@@ -91,7 +91,10 @@ main! = |_args| {
 ## files, cannot be fixed here, so it does not.
 check! : Str => Try({}, [Exit(I32)])
 check! = |file| {
-	output = Cmd.new(OsStr.from_str("roc")).args(["check", file].map(OsStr.from_str)).stdout(Tee).stderr(Tee).run!() ? |_| Exit(1)
+	# WORKAROUND: --no-cache, see https://github.com/roc-lang/roc/issues/12564.
+	# Checking examples/small first leaves the cache in a state where
+	# examples/rebellion's Catalog.from_schema crashes at compile time.
+	output = Cmd.new(OsStr.from_str("roc")).args(["check", "--no-cache", file].map(OsStr.from_str)).stdout(Tee).stderr(Tee).run!() ? |_| Exit(1)
 	match output.status {
 		Exited(0) => Ok({})
 		Exited(2) => {
