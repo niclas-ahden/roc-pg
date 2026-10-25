@@ -1,32 +1,41 @@
 ## A connection to a Postgres server.
 ##
-## Open one with `Client.connect!`, passing the platform's `connect!` and its
-## random numbers, which a SCRAM login needs. Everything after that goes
-## through two methods of the stream `connect!` returns, `write!` and
-## `read_exactly!`, each taking a timeout in milliseconds, as `Tcp.Stream`
-## does on [basic-cli](https://github.com/roc-lang/basic-cli):
+## Open one with `Client.connect!`, passing a `connect!` that dials the
+## platform's TCP and its random numbers, which a SCRAM login needs.
+## Everything after that goes through two methods of the connection
+## `connect!` returns, `write_bytes!` and `read_exactly!`, as `Tcp.Connection`
+## has them on [basic-cli](https://github.com/roc-lang/basic-cli):
 ##
 ## ```
-## Db : Client.Client(Tcp.Stream, Schema)
+## Db : Client.Client(Tcp.Connection, Schema)
 ##
 ## db = Client.connect!({
-##     connect!: Tcp.connect!,
+##     connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) }),
 ##     random_u64!: Random.seed_u64!,
 ##     host: "localhost",
 ##     port: 5432,
 ##     user: "postgres",
 ##     database: "postgres",
 ##     auth: Password(password),
+##     statement_timeout: Duration.seconds(30),
 ## })?
 ##
 ## names : List({ name : Str })
 ## names = db.query!("select name from users where team_id = $team_id", { team_id, })?
 ## ```
 ##
-## On [basic-webserver](https://github.com/roc-lang/basic-webserver), whose
-## streams take no timeout, wrap its `connect!` in `Client.fixed_timeout`.
-## The client is then a
-## `Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)`.
+## The timeouts belong to the connection, so the app sets them in its
+## `connect!`. Make the connection's `io_timeout` a few seconds longer than
+## `statement_timeout`. The server sends nothing while a statement runs, so
+## with a shorter `io_timeout` a slow statement breaks the connection with
+## `PgReadErr`, where it would otherwise fail with `PgErr` and leave the
+## connection usable. The client cannot check this for you, since it cannot
+## see the connection's timeout.
+##
+## On [basic-webserver](https://github.com/roc-lang/basic-webserver), wrap
+## its `Tcp.connect!` in `Client.basic_webserver`, and give the statement
+## timeout as `Client.millis(ms)`, since it has no `Duration`. The client is
+## then a `Client.Client(Client.BasicWebserver(Tcp.Connection), Schema)`.
 ##
 ## `Schema` is the schema your queries are checked against (see [Catalog]),
 ## or [NoSchema] if you have none.
@@ -38,8 +47,8 @@
 ## platform does. To reach a database on another machine until then, you
 ## can connect to a TLS proxy on this one, such as a
 ## [PgBouncer](https://www.pgbouncer.org) that talks TLS to the database.
-## `timeout_ms` limits each connect, read and write, not a whole query. See
-## `Client.connect!` for the timeouts and for how the client logs in.
+## See `Client.connect!` for the statement timeout and for how the client
+## logs in.
 ##
 ## The functions take the client first, so you call them as methods:
 ##
@@ -96,7 +105,6 @@ import RowFormat
 ## [Catalog]), or [NoSchema].
 Client(stream, schema) :: {
 	stream : stream,
-	timeout_ms : U64,
 	backend_key : [Known(ProtoBackend.KeyData), Pending],
 	# Set on the client a transaction! body gets, so that a transaction!
 	# called on it goes straight to a savepoint.
@@ -194,8 +202,9 @@ Client(stream, schema) :: {
 	## the transaction back.
 	TransactionErr(read, write, others) : [TransactionBeginFailed(Client.CommandErr(read, write, [])), TransactionCommitRefused(Client.ServerError), TransactionCommitFailed(Client.CommandErr(read, write, [])), TransactionAborted, ..others]
 
-	## Connect and authenticate. `connect!` is the platform's dial (`Tcp.connect!`)
-	## and `random_u64!` its random numbers (`Random.seed_u64!`), for the nonce
+	## Connect and authenticate. `connect!` dials the platform's TCP with the
+	## timeouts the app wants, given the host and port, and `random_u64!` is
+	## its random numbers (`Random.seed_u64!`), for the nonce
 	## of a SCRAM login. `auth` is `NoAuth` or `Password(str)`. The
 	## server decides how the password is checked, and the client answers
 	## SCRAM-SHA-256 (PostgreSQL 10 and later), md5 (any version) and
@@ -233,79 +242,93 @@ Client(stream, schema) :: {
 	## `UTF8` because every string is read as UTF-8. Case does not matter,
 	## as it does not for setting names.
 	##
-	## `statement_timeout_ms` is optional: how long a statement may run before
-	## the server cancels it, which fails it with `PgErr` and SQLSTATE `57014`
-	## and leaves the connection usable. Off by default, as in Postgres. It is
-	## sent when the session starts, and one transaction can lift it with
-	## `set local statement_timeout = 0`. [PgBouncer](https://www.pgbouncer.org)
-	## refuses startup parameters it does not know, so behind
-	## [PgBouncer](https://www.pgbouncer.org) set it on the role instead.
+	## `statement_timeout` is how long a statement may run before the server
+	## cancels it, which fails it with `PgErr` and SQLSTATE `57014` and leaves
+	## the connection usable. It is a duration, anything with a `to_millis`,
+	## such as basic-cli's `Duration.seconds(30)`, or `Client.millis(30_000)`
+	## on a platform without one. A zero duration means no statement timeout,
+	## as in Postgres. It is sent when the session starts, and one transaction
+	## can lift it with `set local statement_timeout = 0`.
+	## [PgBouncer](https://www.pgbouncer.org) refuses startup parameters it
+	## does not know, so behind [PgBouncer](https://www.pgbouncer.org) pass a
+	## zero duration and set it on the role instead.
 	##
-	## `timeout_ms` is optional: how long the dial and each read or write may
-	## wait. It is the backstop for a server or network that
-	## stops answering, and must outlast the longest statement, because the
-	## server sends nothing while one runs. By default 5 seconds more than
-	## `statement_timeout_ms`, or 60 seconds without one. A job with longer
-	## statements passes its own.
-	connect! : { connect! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms ?: U64, statement_timeout_ms ?: U64, params ?: List((Str, Str)), auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, others))
-	connect! = |{ connect!: dial!, random_u64!, host, port, user, database, auth, timeout_ms: given_timeout_ms, statement_timeout_ms, params, auth_methods }| {
-		statement_ms = statement_timeout_ms ?? 0
-		connect_with!({ dial!, random_u64!, host, port, user, database, auth, timeout_ms: given_timeout_ms ?? default_timeout_ms(statement_ms), params: statement_timeout_params(statement_ms).concat(params ?? []), auth_methods: auth_methods ?? all_auth_methods })
-	}
+	## The connection's own timeout must be a few seconds longer than
+	## `statement_timeout` (see the module doc). The server sends nothing
+	## while a statement runs, so a shorter one breaks the connection with
+	## `PgReadErr` before the server can cancel the statement.
+	connect! : { connect! : Str, U16 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], statement_timeout : duration, params ?: List((Str, Str)), auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, others))
+		where [duration.to_millis : duration -> U64]
+	connect! = |{ connect!: dial!, random_u64!, host, port, user, database, auth, statement_timeout, params, auth_methods }|
+		connect_with!({ dial!, random_u64!, host, port, user, database, auth, params: statement_timeout_params(statement_timeout.to_millis()).concat(params ?? []), auth_methods: auth_methods ?? all_auth_methods })
 
 	## Connect with the settings of a connection URL, the form hosted
 	## databases hand out, like
 	## `postgresql://user:password@localhost:5432/app?sslmode=disable`.
-	## See [ConnectionUrl] for what each part means. `connect!` and
-	## `random_u64!` are those of [Client.connect!], and the rest is optional,
-	## as there. A URL it refuses fails with `InvalidConnectionUrl(err)`,
-	## carrying a [ConnectionUrl.ParseErr].
+	## See [ConnectionUrl] for what each part means. `connect!`,
+	## `random_u64!` and `statement_timeout` are those of [Client.connect!],
+	## and `auth_methods` is optional, as there. A URL it refuses fails with
+	## `InvalidConnectionUrl(err)`, carrying a [ConnectionUrl.ParseErr].
 	##
 	## ```
-	## client = Client.connect_url!(url, { connect!: Tcp.connect!, random_u64!: Random.seed_u64!, statement_timeout_ms: 30_000 })?
+	## client = Client.connect_url!(url, {
+	##     connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) }),
+	##     random_u64!: Random.seed_u64!,
+	##     statement_timeout: Duration.seconds(30),
+	## })?
 	## ```
-	connect_url! : Str, { connect! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), timeout_ms ?: U64, statement_timeout_ms ?: U64, auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, [InvalidConnectionUrl(ConnectionUrl.ParseErr), ..others]))
-	connect_url! = |url, { connect!: dial!, random_u64!, timeout_ms, statement_timeout_ms, auth_methods }| {
+	connect_url! : Str, { connect! : Str, U16 => Try(_, _), random_u64! : () => Try(U64, _), statement_timeout : duration, auth_methods ?: List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, [InvalidConnectionUrl(ConnectionUrl.ParseErr), ..others]))
+		where [duration.to_millis : duration -> U64]
+	connect_url! = |url, { connect!: dial!, random_u64!, statement_timeout, auth_methods }| {
 		settings = ConnectionUrl.parse(url) ? |err| InvalidConnectionUrl(err)
-		statement_ms = statement_timeout_ms ?? 0
-		connect_with!({ dial!, random_u64!, host: settings.host, port: settings.port, user: settings.user, database: settings.database, auth: settings.auth, timeout_ms: timeout_ms ?? default_timeout_ms(statement_ms), params: statement_timeout_params(statement_ms).concat(settings.params), auth_methods: auth_methods ?? all_auth_methods })
+		connect_with!({ dial!, random_u64!, host: settings.host, port: settings.port, user: settings.user, database: settings.database, auth: settings.auth, params: statement_timeout_params(statement_timeout.to_millis()).concat(settings.params), auth_methods: auth_methods ?? all_auth_methods })
 	}
 
-	## A stream from a platform whose reads and writes take no timeout, given
-	## the `write!` and `read_exactly!` that [Client.connect!] calls. They
-	## drop the timeout, and the platform's own applies instead. See
-	## [Client.fixed_timeout].
-	# Transparent, although nothing outside needs its field. Its methods are
-	# unannotated, since the stream's own vary by platform, and at 7d7b432
-	# such methods of an opaque (`::`) type do not type check.
-	FixedTimeout(stream) := { stream : stream }.{
-		write! = |fixed, bytes, _timeout_ms| fixed.stream.write!(bytes)
-		read_exactly! = |fixed, len, _timeout_ms| fixed.stream.read_exactly!(len)
+	## A length of time in milliseconds, for the `statement_timeout` of
+	## [Client.connect!] on a platform without a `Duration` of its own, such as
+	## [basic-webserver](https://github.com/roc-lang/basic-webserver). Make one
+	## with [Client.millis].
+	Millis :: U64.{
+		## The milliseconds, which [Client.connect!] reads.
+		to_millis : Millis -> U64
+		to_millis = |Millis.(ms)| ms
 	}
 
-	## The `connect!` of a platform whose streams take no timeout, made fit
-	## for [Client.connect!].
-	## [basic-webserver](https://github.com/roc-lang/basic-webserver)'s
-	## `Tcp.Stream` is one: it gives every dial, read and write a fixed 30
+	## A [Client.Millis] of `ms` milliseconds: `Client.millis(30_000)` is 30
 	## seconds.
+	millis : U64 -> Client.Millis
+	millis = |ms| Client.Millis.(ms)
+
+	## A [basic-webserver](https://github.com/roc-lang/basic-webserver)
+	## connection, with the `write_bytes!` and `read_exactly!` that
+	## [Client.connect!] calls. basic-webserver names its write `write!`,
+	## where [basic-cli](https://github.com/roc-lang/basic-cli), whose names
+	## this package follows, says `write_bytes!`. Make one with
+	## [Client.basic_webserver].
+	# Transparent, although nothing outside needs its field. Its methods are
+	# unannotated, since the connection's own errors vary by platform, and
+	# at 7d7b432 such methods of an opaque (`::`) type do not type check.
+	BasicWebserver(stream) := { stream : stream }.{
+		write_bytes! = |wrapped, bytes| wrapped.stream.write!(bytes)
+		read_exactly! = |wrapped, len| wrapped.stream.read_exactly!(len)
+	}
+
+	## basic-webserver's `Tcp.connect!`, made fit for [Client.connect!].
 	##
 	## ```
-	## client = Client.connect!({ connect!: Client.fixed_timeout(Tcp.connect!), random_u64!: || Err(NoRandom), host, port, user, database, auth })?
+	## client = Client.connect!({ connect!: Client.basic_webserver(Tcp.connect!), random_u64!: || Err(NoRandom), host, port, user, database, auth, statement_timeout: Client.millis(25_000) })?
 	## ```
 	##
-	## basic-webserver has no random numbers either, hence `|| Err(NoRandom)`,
-	## which rules out a SCRAM login.
-	##
-	## `timeout_ms` then has no effect, and a statement that runs longer than
-	## the platform's timeout fails with `PgReadErr`. Set a shorter
-	## `statement_timeout` on the role, which fails such a statement with
-	## `PgErr` instead and leaves the connection usable. The client's type is
-	## `Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)`.
-	fixed_timeout : (Str, U16 => Try(stream, err)) -> (Str, U16, U64 => Try(Client.FixedTimeout(stream), err))
-	fixed_timeout = |dial!|
-		|host, port, _timeout_ms|
+	## basic-webserver gives every dial, read and write a fixed 30 seconds,
+	## so keep `statement_timeout` a few seconds under that. It has no random
+	## numbers either, hence `|| Err(NoRandom)`, which rules out a SCRAM
+	## login. The client's type is
+	## `Client.Client(Client.BasicWebserver(Tcp.Connection), Schema)`.
+	basic_webserver : (Str, U16 => Try(stream, err)) -> (Str, U16 => Try(Client.BasicWebserver(stream), err))
+	basic_webserver = |dial!|
+		|host, port|
 			match dial!(host, port) {
-				Ok(stream) => Ok(Client.FixedTimeout.{ stream })
+				Ok(stream) => Ok(Client.BasicWebserver.{ stream })
 				Err(err) => Err(err)
 			}
 
@@ -605,8 +628,8 @@ Client(stream, schema) :: {
 	## Run `body!` inside one `begin`/`commit` on this connection, which is
 	## passed to it. When `body!` fails, the transaction is rolled back and
 	## its error returned, so a partial write never lands. When it failed
-	## because the server stopped answering, the rollback waits out
-	## `timeout_ms` once more before it gives up. The server rolls the
+	## because the server stopped answering, the rollback waits out the
+	## connection's timeout once more before it gives up. The server rolls the
 	## transaction back by itself when the connection goes away.
 	##
 	## A body that returns `Ok` although one of its statements failed (it
@@ -834,18 +857,7 @@ run_statement! = |client, stmt| {
 	read_reply!(client, init_columns)
 }
 
-## The `timeout_ms` of [Client.connect!] when none is given: 5 seconds more
-## than the statement timeout, which a healthy server always answers within,
-## or 60 seconds without one.
-default_timeout_ms : U64 -> U64
-default_timeout_ms = |statement_timeout_ms|
-	if statement_timeout_ms > 0 {
-		statement_timeout_ms + 5_000
-	} else {
-		60_000
-	}
-
-## The startup parameter that sets `statement_timeout_ms`, none for 0. Used
+## The startup parameter that sets the statement timeout, none for 0. Used
 ## by [Client.connect!], ahead of the caller's own `params`, which win.
 statement_timeout_params : U64 -> List((Str, Str))
 statement_timeout_params = |statement_timeout_ms|
@@ -895,7 +907,7 @@ expect check_no_nul("select 1\u(0)drop table x", "sql") == Err(ContainsNul("sql"
 ## effect function's return type.
 write_all! : Client(_, _), List(U8) => Try({}, [PgWriteErr(_), ..others])
 write_all! = |client, bytes| {
-	match client.stream.write!(bytes, client.timeout_ms) {
+	match client.stream.write_bytes!(bytes) {
 		Ok(v) => Ok(v)
 		Err(err) => Err(PgWriteErr(err))
 	}
@@ -903,7 +915,7 @@ write_all! = |client, bytes| {
 
 read_bytes! : Client(_, _), U64 => Try(List(U8), [PgReadErr(_), ..others])
 read_bytes! = |client, len| {
-	match client.stream.read_exactly!(len, client.timeout_ms) {
+	match client.stream.read_exactly!(len) {
 		Ok(bytes) => Ok(bytes)
 		Err(err) => Err(PgReadErr(err))
 	}
@@ -945,10 +957,10 @@ read_message! = |client| {
 ## This is its own function so that a default of each optional setting
 ## costs one call. The compiler gives every `??` on an optional field its
 ## own copy of the code that follows, so with the body below in
-## `connect!` its four optional fields made 16 copies of it, a third of
-## the machine code of an app that only connects.
-connect_with! : { dial! : Str, U16, U64 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms : U64, params : List((Str, Str)), auth_methods : List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, others))
-connect_with! = |{ dial!, random_u64!: random!, host, port, user, database, auth, timeout_ms, params, auth_methods }| {
+## `connect!` each optional field doubled the copies of it, which once made
+## a third of the machine code of an app that only connects.
+connect_with! : { dial! : Str, U16 => Try(_, _), random_u64! : () => Try(U64, _), host : Str, port : U16, user : Str, database : Str, auth : [NoAuth, Password(Str)], params : List((Str, Str)), auth_methods : List([Scram, Md5, Cleartext, Trust]) } => Try(Client(_, _), Client.ConnectErr(_, _, _, others))
+connect_with! = |{ dial!, random_u64!: random!, host, port, user, database, auth, params, auth_methods }| {
 	# The startup message is a list of C strings, so a NUL byte in any of
 	# them would end it early and turn the rest into settings of its own.
 	for (name, _) in params {
@@ -967,19 +979,19 @@ connect_with! = |{ dial!, random_u64!: random!, host, port, user, database, auth
 		NoAuth => {}
 	}
 	stream =
-		match dial!(host, port, timeout_ms) {
+		match dial!(host, port) {
 			Ok(s) => Ok(s)
 			Err(err) => Err(PgConnectErr(TcpConnectErr(err)))
 		}?
-	do_startup!(stream, { user, database, auth, timeout_ms, params, auth_methods, random_u64!: random! })
+	do_startup!(stream, { user, database, auth, params, auth_methods, random_u64!: random! })
 }
 
 ## The startup conversation: send the startup message, answer an auth
 ## challenge if the server sends one, then collect the backend key until
 ## ReadyForQuery.
-do_startup! : _, { user : Str, database : Str, auth : [NoAuth, Password(Str)], timeout_ms : U64, params : List((Str, Str)), auth_methods : List([Scram, Md5, Cleartext, Trust]), random_u64! : () => Try(U64, _) } => Try(Client(_, _), Client.StartupErr(_, _, others))
-do_startup! = |stream, { user, database, auth, timeout_ms, params, auth_methods, random_u64! }| {
-	client = Client.{ stream, timeout_ms, backend_key: Pending, in_transaction: Bool.False }
+do_startup! : _, { user : Str, database : Str, auth : [NoAuth, Password(Str)], params : List((Str, Str)), auth_methods : List([Scram, Md5, Cleartext, Trust]), random_u64! : () => Try(U64, _) } => Try(Client(_, _), Client.StartupErr(_, _, others))
+do_startup! = |stream, { user, database, auth, params, auth_methods, random_u64! }| {
+	client = Client.{ stream, backend_key: Pending, in_transaction: Bool.False }
 	write_all!(client, ProtoFrontend.startup({ user, database, params }))?
 	startup_loop!(client, { user, auth, auth_methods, random_u64! }, Waiting)
 }

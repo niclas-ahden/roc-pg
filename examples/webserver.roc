@@ -26,7 +26,7 @@ Context : { host : Str, port : U16, user : Str, database : Str }
 
 ## A connection on basic-webserver. `NoSchema` because this example only
 ## runs unchecked queries.
-Db : Client.Client(Client.FixedTimeout(Tcp.Stream), NoSchema)
+Db : Client.Client(Client.BasicWebserver(Tcp.Connection), NoSchema)
 
 program = { init!, respond!, shutdown! }
 
@@ -57,9 +57,9 @@ respond! = |_request, context|
 ## whatever `body!` returned.
 with_db! = |{ host, port, user, database }, body!| {
 	db = Client.connect!({
-		# basic-webserver's streams take no timeout: the platform gives each
-		# connect, read and write a fixed 30 seconds.
-		connect!: Client.fixed_timeout(Tcp.connect!),
+		# basic-webserver names its write `write!`, not `write_bytes!`, and
+		# gives each connect, read and write a fixed 30 seconds.
+		connect!: Client.basic_webserver(Tcp.connect!),
 		# basic-webserver has no random numbers, which only a SCRAM login
 		# needs. Log in to PgBouncer another way, such as trust or md5.
 		random_u64!: || Err(NoRandom),
@@ -68,6 +68,10 @@ with_db! = |{ host, port, user, database }, body!| {
 		user,
 		database,
 		auth: NoAuth,
+		# A few seconds under the platform's 30, so a slow statement fails
+		# with `PgErr` and leaves the connection usable. basic-webserver has
+		# no Duration, hence `Client.millis`.
+		statement_timeout: Client.millis(25_000),
 	})?
 	result = body!(db)
 	db.close!()

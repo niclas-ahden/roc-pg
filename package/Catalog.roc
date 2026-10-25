@@ -15,7 +15,7 @@
 ##
 ## Schema := [].{ catalog = |{}| parsed_schema }
 ##
-## Db : Client.Client(Tcp.Stream, Schema)
+## Db : Client.Client(Tcp.Connection, Schema)
 ## ```
 ##
 ## The compiler checks a query through its type alone, so the schema rides

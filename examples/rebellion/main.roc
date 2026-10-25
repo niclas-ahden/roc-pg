@@ -11,6 +11,7 @@ app [main!] {
 
 import pf.Stdout
 import pf.Tcp
+import pf.Duration
 import pf.Random
 import pf.OsStr
 import pg.Client
@@ -33,7 +34,7 @@ main! = |os_args| {
 	args = List.map(os_args, OsStr.display)
 	match args {
 		[url, area, .. as command] => {
-			db = Client.connect_url!(url, { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
+			db = Client.connect_url!(url, { connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) }), random_u64!: Random.seed_u64!, statement_timeout: Duration.seconds(30) })?
 			output =
 				match area {
 					"bases" => Bases.run!(command, db)

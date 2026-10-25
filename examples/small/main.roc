@@ -12,6 +12,7 @@ app [main!] {
 
 import pf.Stdout
 import pf.Tcp
+import pf.Duration
 import pf.Random
 import pf.OsStr
 import pg.Client
@@ -22,7 +23,7 @@ parsed_schema = Catalog.from_schema(schema_sql)
 
 Schema := [].{ catalog = |{}| parsed_schema }
 
-Db : Client.Client(Tcp.Stream, Schema)
+Db : Client.Client(Tcp.Connection, Schema)
 
 planets_01! : I32, Db => Try(List({ id : I32, name : Str, star_system_id : I32, climate : Try(Str, [Null]), terrain : Try(Str, [Null]), diameter_km : Try(F64, [Null]), gravity_standard : Try(F64, [Null]), rotation_period_hours : Try(F64, [Null]) }), _)
 planets_01! = |min_threat, db|
@@ -108,7 +109,7 @@ main! : List(OsStr) => Try({}, _)
 main! = |os_args| {
 	match List.map(os_args, OsStr.display) {
 		[url] => {
-			db = Client.connect_url!(url, { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
+			db = Client.connect_url!(url, { connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) }), random_u64!: Random.seed_u64!, statement_timeout: Duration.seconds(30) })?
 			Stdout.line!(Str.inspect(planets_01!(0, db)))?
 			Stdout.line!(Str.inspect(planets_02!(0, db)))?
 			Stdout.line!(Str.inspect(planets_03!(0, db)))?

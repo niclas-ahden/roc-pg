@@ -10,6 +10,7 @@ app [main!] {
 
 import pf.Stdout
 import pf.Tcp
+import pf.Duration
 import pf.Random
 import pg.Client
 import pg.Param
@@ -18,14 +19,14 @@ import pg.PgResult
 main! = |_args| {
 	client = Client.connect!(
 		{
-			connect!: Tcp.connect!,
+			connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) }),
 			random_u64!: Random.seed_u64!,
 			host: "localhost",
 			port: 5432,
 			user: "postgres",
 			database: "postgres",
 			auth: NoAuth,
-			timeout_ms: 5000,
+			statement_timeout: Duration.seconds(30),
 		},
 	)?
 

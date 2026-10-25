@@ -3,7 +3,7 @@
 ## columns or types.
 ##
 ## ```
-## Db : Client.Client(Tcp.Stream, NoSchema)
+## Db : Client.Client(Tcp.Connection, NoSchema)
 ## ```
 import Catalog
 

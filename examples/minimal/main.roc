@@ -5,6 +5,7 @@ app [main!] {
 
 import pf.Stdout
 import pf.Tcp
+import pf.Duration
 import pf.Random
 import pg.Client
 import pg.Catalog
@@ -19,8 +20,8 @@ Schema := [].{
 }
 
 main! = |_| {
-	db : Client.Client(Tcp.Stream, Schema)
-	db = Client.connect_url!("some-database-url", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
+	db : Client.Client(Tcp.Connection, Schema)
+	db = Client.connect_url!("some-database-url", { connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) }), random_u64!: Random.seed_u64!, statement_timeout: Duration.seconds(30) })?
 
 	planets = db.query!("SELECT id, name FROM planets", {})?
 

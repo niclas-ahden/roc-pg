@@ -68,6 +68,7 @@ header =
 	\\
 	\\import pf.Stdout
 	\\import pf.Tcp
+	\\import pf.Duration
 	\\import pf.Random
 	\\import pf.OsStr
 	\\import pg.Client
@@ -93,14 +94,14 @@ header =
 	\\	catalog = |{}| catalog
 	\\}
 	\\
-	\\Db : Client.Client(Tcp.Stream, Schema)
+	\\Db : Client.Client(Tcp.Connection, Schema)
 	\\
 
 main_start =
 	\\
 	\\main! : List(OsStr) => Try({}, _)
 	\\main! = |_args| {
-	\\	db = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: "localhost", port: 5432, user: "postgres", database: "postgres", auth: NoAuth, timeout_ms: 5000 })?
+	\\	db = Client.connect!({ connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(5) }), random_u64!: Random.seed_u64!, host: "localhost", port: 5432, user: "postgres", database: "postgres", auth: NoAuth, statement_timeout: Duration.zero })?
 
 main_end =
 	\\	Stdout.line!("done")

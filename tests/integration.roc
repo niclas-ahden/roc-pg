@@ -14,12 +14,23 @@ app [main!] {
 
 import pf.Stdout
 import pf.Tcp
+import pf.Duration
 import pf.OsStr
 import pf.Random
 import pg.Client
 import pg.Param
 import pg.Statement
 import pg.PgResult
+import pg.NoSchema
+
+## Dial the test server. No statement here runs for long, so five seconds
+## for the dial and each read or write is plenty, and the tests connect
+## without a statement timeout unless they test one.
+## The client every test gets. The tests run unchecked queries only, so
+## it has no schema.
+Db : Client.Client(Tcp.Connection, NoSchema)
+
+dial! = |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(5) })
 
 main! : List(OsStr) => Try({}, _)
 main! = |args| {
@@ -34,14 +45,14 @@ main! = |args| {
 
 	client = Client.connect!(
 		{
-			connect!: Tcp.connect!,
+			connect!: dial!,
 			random_u64!: Random.seed_u64!,
 			host: server.host,
 			port: server.port,
 			user: server.user,
 			database: server.database,
 			auth: NoAuth,
-			timeout_ms: 5000,
+			statement_timeout: Duration.zero,
 		},
 	)?
 	Stdout.line!("ok: connect")?
@@ -86,6 +97,7 @@ check : Str, Bool -> Try({}, [TestFailed(Str)])
 check = |label, ok| if ok Ok({}) else Err(TestFailed(label))
 
 ## Every row accessor type against literal Postgres values.
+test_decoding! : Db => Try({}, _)
 test_decoding! = |client| {
 	cmd = Statement.new_unchecked("select 'hello' as s, 250::int2 as small, -7::int as i, 9000000000::int8 as big, 2.5::float8 as f, 2.25::float4 as f4, 1.25::numeric as d, true as t, false as f2, 'raw'::bytea as b")
 	result = client.command!(cmd)?
@@ -122,6 +134,7 @@ test_decoding! = |client| {
 
 ## Bytes sent with Param.bytes come back from row.bytes as they went, every
 ## value from 0 to 255 included.
+test_bytea_round_trip! : Db => Try({}, _)
 test_bytea_round_trip! = |client| {
 	sent = List.repeat({}, 256).map_with_index(|_, n| n.to_u8_wrap())
 	back = client.query_one_unchecked!("select $1::bytea as b", [Param.bytes(sent)], |row| row.bytes("b"))?
@@ -130,6 +143,7 @@ test_bytea_round_trip! = |client| {
 }
 
 ## The nullable accessors return Null for NULL and Present otherwise.
+test_nulls! : Db => Try({}, _)
 test_nulls! = |client| {
 	cmd = Statement.new_unchecked("select null::text as no_s, 'x' as yes_s, null::int as no_i, 5::int as yes_i, null::bool as no_b, true as yes_b, null::bytea as no_by, 'raw'::bytea as yes_by, null::int2 as no_u8, 250::int2 as yes_u8, null::int8 as no_u64, 9000000000::int8 as yes_u64")
 	result = client.command!(cmd)?
@@ -170,6 +184,7 @@ test_nulls! = |client| {
 
 ## DDL and DML: create a table, insert with bindings (including a NULL),
 ## and read the rows back.
+test_table_round_trip! : Db => Try({}, _)
 test_table_round_trip! = |client| {
 	_ = client.command!(Statement.new_unchecked("create temp table people (name text not null, age int)"))?
 	insert = Statement.new_unchecked("insert into people (name, age) values ($1, $2), ($3, $4)")
@@ -191,6 +206,7 @@ test_table_round_trip! = |client| {
 
 ## A failing command must not desync the connection: the client drains the
 ## conversation to ReadyForQuery, so the next command still works.
+test_error_recovery! : Db => Try({}, _)
 test_error_recovery! = |client| {
 	match client.command!(Statement.new_unchecked("select nope from does_not_exist")) {
 		Ok(_) => Err(TestFailed("query of missing table should fail"))
@@ -219,6 +235,7 @@ test_error_recovery! = |client| {
 ## constraint, Execute completes (CommandComplete) and the violation only
 ## surfaces at the implicit commit on Sync. command! must report that error,
 ## and the drain must leave the connection usable.
+test_commit_error! : Db => Try({}, _)
 test_commit_error! = |client| {
 	_ = client.command!(Statement.new_unchecked("create temp table deferred_unique (i int unique deferrable initially deferred)"))?
 
@@ -235,6 +252,7 @@ test_commit_error! = |client| {
 }
 
 ## Prepared statements run many times with fresh bindings.
+test_prepared! : Db => Try({}, _)
 test_prepared! = |client| {
 	add_cmd = client.prepare_unchecked!("select $1::int + $2::int as result", { name: "add" })?
 
@@ -256,6 +274,7 @@ test_prepared! = |client| {
 
 ## transaction! commits a body that succeeds and rolls back one that fails.
 ## query! and execute! are command! with the encoding and decoding done.
+test_transaction! : Db => Try({}, _)
 test_transaction! = |client| {
 	_ = client.execute_unchecked!("create temp table tx_people (name text)", [])?
 	inserted = client.transaction!(|db| {
@@ -283,6 +302,7 @@ test_transaction! = |client| {
 ## A body that catches a failed statement and returns Ok commits nothing:
 ## the server rolls the transaction back at `commit`, and transaction!
 ## reports that instead of the body's value.
+test_transaction_aborted! : Db => Try({}, _)
 test_transaction_aborted! = |client| {
 	_ = client.execute_unchecked!("create temp table aborted_people (name text)", [])?
 	aborted = client.transaction!(|db| {
@@ -306,6 +326,7 @@ test_transaction_aborted! = |client| {
 ## the enclosing commit decides for all of it. That holds when the nested
 ## call goes through the outer connection too, as a body that closes over
 ## it does.
+test_nested_transactions! : Db => Try({}, _)
 test_nested_transactions! = |client| {
 	_ = client.execute_unchecked!("create temp table nested (name text)", [])?
 
@@ -404,6 +425,7 @@ test_nested_transactions! = |client| {
 ## without the `begin` that makes the server warn "there is already a
 ## transaction in progress". Reads the server's log through pg_read_file,
 ## which needs the superuser and the log file ./tests.roc sets up.
+test_nested_transactions_quiet! : Db => Try({}, _)
 test_nested_transactions_quiet! = |client| {
 	before = log_size!(client)?
 	_ = client.transaction!(|outer| outer.transaction!(|inner| inner.transaction!(|db| db.execute_unchecked!("select 1", []))))?
@@ -416,17 +438,22 @@ test_nested_transactions_quiet! = |client| {
 	Stdout.line!("ok: nested transactions without server warnings")
 }
 
+log_size! : Db => Try(I64, _)
 log_size! = |client| client.query_one_unchecked!("select (pg_stat_file('log')).size as n", [], |r| r.i64("n"))
 
+log_since! : Db, I64 => Try(Str, _)
 log_since! = |client, offset| client.query_one_unchecked!("select pg_read_file('log', $1::int8, 1000000) as text", [Param.i64(offset)], |r| r.str("text"))
 
+nested_names! : Db => Try(List(Str), _)
 nested_names! = |client| client.query_unchecked!("select name from nested order by name", [], |row| row.str("name"))
 
+nested_count! : Db, Str => Try(I32, _)
 nested_count! = |client, table| client.query_one_unchecked!("select count(*)::int as n from ${table}", [], |row| row.i32("n"))
 
 ## execute! returns how many rows a statement affected, and zero for one
 ## that reports no count. The count comes from the command tag, which
 ## PgResult keeps.
+test_execute_counts! : Db => Try({}, _)
 test_execute_counts! = |client| {
 	created = client.execute_unchecked!("create temp table counted (n int)", [])?
 	check("execute! counts nothing for create table", created == 0)?
@@ -452,6 +479,7 @@ piped_names! = |client|
 ## Statements sent together and answered in one round trip: each one's row
 ## count in order, every write or none, and a usable connection after a
 ## failure.
+test_pipeline! : Db => Try({}, _)
 test_pipeline! = |client| {
 	_ = client.execute_unchecked!("create temp table piped (id int primary key, name text not null)", [])?
 	add = |id, name| { sql: "insert into piped (id, name) values ($1, $2)", params: [Param.i32(id), Param.str(name)] }
@@ -514,6 +542,7 @@ test_pipeline! = |client| {
 ## Several statements in one simple query. The server splits them, so a `;`
 ## in a string, a comment or a function body is safe. A failing statement
 ## rolls the whole batch back, and the connection stays usable after it.
+test_batch_execute! : Db => Try({}, _)
 test_batch_execute! = |client| {
 	client.batch_execute_unchecked!(
 		Str.join_with(
@@ -568,20 +597,21 @@ test_batch_execute! = |client| {
 ## makes the server demand a password from this one user, so this test only
 ## passes on the throwaway server it boots (a `trust` server never sends a
 ## password challenge).
+test_password_auth! : _, Db => Try({}, _)
 test_password_auth! = |server, admin| {
 	_ = admin.command!(Statement.new_unchecked("drop user if exists roc_pg_password_test"))?
 	_ = admin.command!(Statement.new_unchecked("create user roc_pg_password_test password 'opensesame'"))?
 
 	authed = Client.connect!(
 		{
-			connect!: Tcp.connect!,
+			connect!: dial!,
 			random_u64!: Random.seed_u64!,
 			host: server.host,
 			port: server.port,
 			user: "roc_pg_password_test",
 			database: server.database,
 			auth: Password("opensesame"),
-			timeout_ms: 5000,
+			statement_timeout: Duration.zero,
 		},
 	)?
 	result = authed.command!(Statement.new_unchecked("select 1 as one"))?
@@ -592,14 +622,14 @@ test_password_auth! = |server, admin| {
 	match
 		Client.connect!(
 			{
-				connect!: Tcp.connect!,
+				connect!: dial!,
 				random_u64!: Random.seed_u64!,
 				host: server.host,
 				port: server.port,
 				user: "roc_pg_password_test",
 				database: server.database,
 				auth: NoAuth,
-				timeout_ms: 5000,
+				statement_timeout: Duration.zero,
 			},
 		)
 	{
@@ -611,14 +641,14 @@ test_password_auth! = |server, admin| {
 	match
 		Client.connect!(
 			{
-				connect!: Tcp.connect!,
+				connect!: dial!,
 				random_u64!: Random.seed_u64!,
 				host: server.host,
 				port: server.port,
 				user: "roc_pg_password_test",
 				database: server.database,
 				auth: Password("wrong"),
-				timeout_ms: 5000,
+				statement_timeout: Duration.zero,
 			},
 		)
 	{
@@ -631,6 +661,7 @@ test_password_auth! = |server, admin| {
 }
 
 ## query_one! wants exactly one row, and the decoder's errors come through.
+test_query_one! : Db => Try({}, _)
 test_query_one! = |client| {
 	one = client.query_one_unchecked!("select 7 as n", [], |r| r.i32("n"))?
 	check("query_one! one row", one == 7)?
@@ -657,6 +688,7 @@ test_query_one! = |client| {
 
 ## query_optional! tells one row from none inside its result, refuses more
 ## than one, and passes decode and server errors through.
+test_query_optional! : Db => Try({}, _)
 test_query_optional! = |client| {
 	found = client.query_optional_unchecked!("select 7 as n", [], |r| r.i32("n"))?
 	check("query_optional! one row", found == Ok(7))?
@@ -687,6 +719,7 @@ test_query_optional! = |client| {
 ## Arrays go both ways: a Param.list binds a text[] or int[] (the server
 ## infers the element type from the placeholder), and the list accessors
 ## decode the text form back, quoting and all.
+test_arrays! : Db => Try({}, _)
 test_arrays! = |client| {
 	_ = client.execute_unchecked!("create temp table tagged (id int, tags text[], nums int[])", [])?
 	_ = client.execute_unchecked!(
@@ -738,6 +771,7 @@ test_arrays! = |client| {
 ## An enum column takes its label as Param.str and gives it back as a
 ## string, and an enum array is an array like any other. Enum types are
 ## not temporary, so the test drops its own.
+test_enums! : Db => Try({}, _)
 test_enums! = |client| {
 	_ = client.execute_unchecked!("drop type if exists roc_pg_mood", [])?
 	_ = client.execute_unchecked!("create type roc_pg_mood as enum ('sad', 'ok', 'happy')", [])?
@@ -817,6 +851,7 @@ test_md5_and_scram! = |server, admin| {
 ## password, a password that SASLprep changes, and the bounds roc-scram puts
 ## on the iteration count the server asks for. ./tests.roc prepends the
 ## pg_hba rule that makes the server ask these users for SCRAM.
+test_scram_passwords! : _, Db => Try({}, _)
 test_scram_passwords! = |server, admin| {
 	users = [
 		{ user: "roc_pg_scram_utf8_test", password: "pässword with spaces", iterations: 4096 },
@@ -850,7 +885,7 @@ test_scram_passwords! = |server, admin| {
 ## Log in as `user` with `password`, allowing `auth_methods`, and run one
 ## query.
 login! = |server, { user, password }, auth_methods| {
-	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user, database: server.database, auth: Password(password), timeout_ms: 5000, auth_methods })?
+	client = Client.connect!({ connect!: dial!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user, database: server.database, auth: Password(password), statement_timeout: Duration.zero, auth_methods })?
 	one = client.query_one_unchecked!("select 1 as one", [], |r| r.i32("one"))
 	client.close!()
 	check("a query after logging in as ${user}", one? == 1)
@@ -882,13 +917,13 @@ scram_refused = |outcome, reason|
 test_connect_url! = |server| {
 	base = "postgresql://roc_pg_scram_test:scram-secret@${server.host}:${server.port.to_str()}/${server.database}"
 	options = "application_name=roc-pg-insane-in-the-membrane-url&options=-c%20statement_timeout%3D4321"
-	client = Client.connect_url!("${base}?sslmode=disable&${options}", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
+	client = Client.connect_url!("${base}?sslmode=disable&${options}", { connect!: dial!, random_u64!: Random.seed_u64!, statement_timeout: Duration.zero })?
 	application_name = client.query_one_unchecked!("select current_setting('application_name') as name", [], |r| r.str("name"))
 	timeout = client.query_one_unchecked!("select current_setting('statement_timeout') as t", [], |r| r.str("t"))
 	client.close!()
 	check("the URL's application_name reaches the session", application_name? == "roc-pg-insane-in-the-membrane-url")?
 	check("the URL's -c statement_timeout reaches the session", timeout? == "4321ms")?
-	match Client.connect_url!("${base}?sslmode=require", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! }) {
+	match Client.connect_url!("${base}?sslmode=require", { connect!: dial!, random_u64!: Random.seed_u64!, statement_timeout: Duration.zero }) {
 		Err(InvalidConnectionUrl(UnsupportedSslMode("require"))) => Ok({})
 		other => Err(TestFailed("sslmode=require was not refused: ${Str.inspect(other)}"))
 	}?
@@ -899,6 +934,7 @@ test_connect_url! = |server| {
 ## before anything is sent. The protocol carries those as C strings, so the
 ## server would read the rest as further fields: the tail of the SQL, or a
 ## startup setting of its own.
+test_nul_bytes! : _, Db => Try({}, _)
 test_nul_bytes! = |server, client| {
 	nul = |outcome, what|
 		match outcome {
@@ -912,7 +948,7 @@ test_nul_bytes! = |server, client| {
 	after = client.query_one_unchecked!("select 4 as four", [], |r| r.i32("four"))?
 	check("the client works after a refused NUL byte", after == 4)?
 
-	connect! = |settings| Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: settings.user, database: settings.database, auth: settings.auth, params: settings.params, timeout_ms: 5000 })
+	connect! = |settings| Client.connect!({ connect!: dial!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: settings.user, database: settings.database, auth: settings.auth, params: settings.params, statement_timeout: Duration.zero })
 	fine = { user: server.user, database: server.database, auth: NoAuth, params: [] }
 	nul(connect!({ ..fine, user: "${server.user}\u(0)options" }), "user")?
 	nul(connect!({ ..fine, database: "postgres\u(0)x" }), "database")?
@@ -922,7 +958,7 @@ test_nul_bytes! = |server, client| {
 
 	# A percent-encoded NUL in a URL is decoded before it is checked.
 	base = "postgresql://${server.user}@${server.host}:${server.port.to_str()}/${server.database}"
-	nul(Client.connect_url!("${base}?application_name=a%00b", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! }), "parameter application_name")?
+	nul(Client.connect_url!("${base}?application_name=a%00b", { connect!: dial!, random_u64!: Random.seed_u64!, statement_timeout: Duration.zero }), "parameter application_name")?
 	Stdout.line!("ok: NUL bytes")
 }
 
@@ -930,7 +966,7 @@ test_nul_bytes! = |server, client| {
 ## ReadyForQuery. The client returns the server's error, with its SQLSTATE,
 ## rather than failing to read the rest of the conversation.
 test_fatal_error! = |server| {
-	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, timeout_ms: 5000 })?
+	client = Client.connect!({ connect!: dial!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, statement_timeout: Duration.zero })?
 	# 57P01 is admin_shutdown, what a terminated session is told.
 	match client.execute_unchecked!("select pg_terminate_backend(pg_backend_pid())", []) {
 		Err(PgErr(error)) => check("a terminated session is PgErr 57P01 FATAL, got ${error.code} ${error.severity}", error.code == "57P01" and error.severity == "FATAL")
@@ -942,6 +978,7 @@ test_fatal_error! = |server| {
 ## A commit the server refuses inside transaction! (a deferred constraint
 ## that only fails at commit) is TransactionCommitRefused, with the server's
 ## error, and nothing of the transaction lands.
+test_commit_refused! : Db => Try({}, _)
 test_commit_refused! = |client| {
 	_ = client.execute_unchecked!("create temp table deferred_in_transaction (i int unique deferrable initially deferred)", [])?
 	outcome = client.transaction!(|db| db.execute_unchecked!("insert into deferred_in_transaction values (1), (1)", []))
@@ -955,14 +992,14 @@ test_commit_refused! = |client| {
 	Stdout.line!("ok: commit refused inside transaction!")
 }
 
-## statement_timeout_ms has the server cancel a statement that runs too
+## statement_timeout has the server cancel a statement that runs too
 ## long (SQLSTATE 57014), and the connection goes on.
 test_statement_timeout! = |server| {
-	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, statement_timeout_ms: 100 })?
+	client = Client.connect!({ connect!: dial!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, statement_timeout: Duration.millis(100) })?
 	# 57014 is query_canceled.
 	match client.execute_unchecked!("select pg_sleep(2)", []) {
-		Err(PgErr(error)) => check("a statement past statement_timeout_ms is 57014, got ${error.code}", error.code == "57014")
-		other => Err(TestFailed("a statement past statement_timeout_ms was not cancelled: ${Str.inspect(other)}"))
+		Err(PgErr(error)) => check("a statement past statement_timeout is 57014, got ${error.code}", error.code == "57014")
+		other => Err(TestFailed("a statement past statement_timeout was not cancelled: ${Str.inspect(other)}"))
 	}?
 	after = client.query_one_unchecked!("select 5 as five", [], |r| r.i32("five"))?
 	check("the connection works after a cancelled statement", after == 5)?
@@ -972,9 +1009,10 @@ test_statement_timeout! = |server| {
 
 ## A statement prepared on one connection runs on another too, where its
 ## name does not exist: the client parses its SQL again there.
+test_prepared_elsewhere! : _, Db => Try({}, _)
 test_prepared_elsewhere! = |server, client| {
 	add = client.prepare_unchecked!("select $1::int + $2::int as sum", { name: "add_elsewhere" })?
-	other = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, timeout_ms: 5000 })?
+	other = Client.connect!({ connect!: dial!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, statement_timeout: Duration.zero })?
 	elsewhere = other.command!(add.bind([Param.i32(40), Param.i32(2)]))
 	names = other.query_unchecked!("select name from pg_prepared_statements", [], |r| r.str("name"))
 	other.close!()
@@ -996,7 +1034,7 @@ test_param_not_allowed! = |server| {
 			Err(ParamNotAllowed(given)) => check("${name} in params is ParamNotAllowed(${name}), not ParamNotAllowed(${given})", given == name)
 			other => Err(TestFailed("${name} in params was not refused: ${Str.inspect(other)}"))
 		}
-	connect! = |params| Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, params, timeout_ms: 5000 })
+	connect! = |params| Client.connect!({ connect!: dial!, random_u64!: Random.seed_u64!, host: server.host, port: server.port, user: server.user, database: server.database, auth: NoAuth, params, statement_timeout: Duration.zero })
 	refused_param(connect!([("user", "postgres")]), "user")?
 	refused_param(connect!([("application_name", "app"), ("database", "template1")]), "database")?
 	refused_param(connect!([("options", "-c work_mem=64MB")]), "options")?
@@ -1005,8 +1043,8 @@ test_param_not_allowed! = |server| {
 	refused_param(connect!([("client_encoding", "LATIN1")]), "client_encoding")?
 	refused_param(connect!([("CLIENT_ENCODING", "LATIN1")]), "CLIENT_ENCODING")?
 	base = "postgresql://${server.user}@${server.host}:${server.port.to_str()}/${server.database}"
-	refused_param(Client.connect_url!("${base}?options=-c%20user%3Dpostgres", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! }), "user")?
-	refused_param(Client.connect_url!("${base}?options=-c%20client_encoding%3DLATIN1", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! }), "client_encoding")?
+	refused_param(Client.connect_url!("${base}?options=-c%20user%3Dpostgres", { connect!: dial!, random_u64!: Random.seed_u64!, statement_timeout: Duration.zero }), "user")?
+	refused_param(Client.connect_url!("${base}?options=-c%20client_encoding%3DLATIN1", { connect!: dial!, random_u64!: Random.seed_u64!, statement_timeout: Duration.zero }), "client_encoding")?
 	Stdout.line!("ok: names that are not session settings refused in params")
 }
 
@@ -1018,7 +1056,7 @@ test_param_not_allowed! = |server| {
 ## real user, database and UTF8 last. The server must log in with the last
 ## ones and report UTF8.
 test_startup_last_value_wins! = |server| {
-	stream = Tcp.connect!(server.host, server.port, 5000) ? |_| TestFailed("could not connect for the startup message test")
+	stream = dial!(server.host, server.port) ? |_| TestFailed("could not connect for the startup message test")
 	pair = |key, value| key.to_utf8().append(0).concat(value.to_utf8()).append(0)
 	body =
 		# Protocol version 3.0, the key value pairs, and an empty key to end them.
@@ -1030,10 +1068,10 @@ test_startup_last_value_wins! = |server| {
 			.concat(pair("user", server.user))
 			.concat(pair("database", server.database))
 			.append(0)
-	stream.write!(big_endian_u32(body.len() + 4).concat(body), 5000) ? |_| TestFailed("could not send the startup message")
+	stream.write_bytes!(big_endian_u32(body.len() + 4).concat(body)) ? |_| TestFailed("could not send the startup message")
 	reported = read_startup_replies!(stream, [])?
 	# Terminate, best effort.
-	_ = stream.write!(['X', 0, 0, 0, 4], 5000)
+	_ = stream.write_bytes!(['X', 0, 0, 0, 4])
 	check("the server logs in as the last user, it reported ${Str.inspect(reported)}", reported.contains(("session_authorization", server.user)))?
 	check("the server takes the last client_encoding, it reported ${Str.inspect(reported)}", reported.contains(("client_encoding", "UTF8")))?
 	Stdout.line!("ok: the server keeps the last value of a startup key")
@@ -1045,10 +1083,11 @@ big_endian_u32 = |n| [n.shr_zf_wrap(24).to_u8_wrap(), n.shr_zf_wrap(16).to_u8_wr
 ## Read the server's replies to a startup message through ReadyForQuery and
 ## return the settings it reported (ParameterStatus). An error, such as a
 ## role or database that does not exist, fails the test with its text.
+read_startup_replies! : Tcp.Connection, List((Str, Str)) => Try(List((Str, Str)), _)
 read_startup_replies! = |stream, reported| {
-	header = stream.read_exactly!(5, 5000) ? |_| TestFailed("the server closed the connection during the startup")
+	header = stream.read_exactly!(5) ? |_| TestFailed("the server closed the connection during the startup")
 	len = header.drop_first(1).fold(0, |acc, byte| acc * 256 + byte.to_u64())
-	payload = if len > 4 (stream.read_exactly!(len - 4, 5000) ? |_| TestFailed("the server closed the connection during the startup")) else []
+	payload = if len > 4 (stream.read_exactly!(len - 4) ? |_| TestFailed("the server closed the connection during the startup")) else []
 	match header.first() {
 		Ok('Z') => Ok(reported)
 		Ok('E') => Err(TestFailed("the server refused the startup message: ${Str.from_utf8_lossy(payload.map(|byte| if byte == 0 ' ' else byte))}"))
@@ -1065,6 +1104,7 @@ read_startup_replies! = |stream, reported| {
 ## A notification for a channel the session listens on arrives as soon as
 ## the notifying transaction commits, in the middle of a reply. The client
 ## reads past it, for extended and simple queries alike.
+test_notifications_skipped! : Db => Try({}, _)
 test_notifications_skipped! = |client| {
 	_ = client.execute_unchecked!("listen roc_pg_test", [])?
 	_ = client.execute_unchecked!("notify roc_pg_test, 'extended'", [])?

@@ -6,12 +6,13 @@ A PostgreSQL client for Roc that checks every SQL query when the app compiles. W
 
 ```roc
 app [main!] {
-    pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.26.0/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t.tar.zst",
+    pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.25.0/CZsY7tYZwR3rj9kYbpaCfxki2yVAaRL8bBwMLvB2xkbA.tar.zst",
     pg: "https://github.com/niclas-ahden/roc-pg/releases/download/0.4.0/2hQos9tnRU5nE23354wefXWjxiDcFSMV9ydt9s61X5wf.tar.zst",
 }
 
 import pf.Stdout
 import pf.Tcp
+import pf.Duration
 import pf.Random
 import pg.Client
 import pg.Catalog
@@ -26,8 +27,15 @@ Schema := [].{
 }
 
 main! = |_| {
-    db : Client.Client(Tcp.Stream, Schema)
-    db = Client.connect_url!("some-database-url", { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })?
+    db : Client.Client(Tcp.Connection, Schema)
+    db = Client.connect_url!(
+        "some-database-url",
+        {
+            connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) }),
+            random_u64!: Random.seed_u64!,
+            statement_timeout: Duration.seconds(30),
+        },
+    )?
 
     planets = db.query!("SELECT id, name FROM planets WHERE gravity = $gravity", { gravity: 9.80665 })?
 
@@ -251,12 +259,12 @@ Nothing about them is checked before they run. `Param.str`, `Param.i32`, `Param.
 
 ## Connecting
 
-`Client.connect!` takes the connection settings as fields, and `Client.connect_url!` takes them as a URL (see the example at the top). Both also take two functions from the platform: `connect!`, which opens a TCP stream, and `random_u64!`, which a SCRAM login needs.
+`Client.connect!` takes the connection settings as fields, and `Client.connect_url!` takes them as a URL (see the example at the top). Both also take two functions from the platform: `connect!`, which opens a TCP connection to a host and port with the timeouts you want, and `random_u64!`, which a SCRAM login needs. Both take a `statement_timeout` too (see [Timeouts](#timeouts)).
 
 ### Platforms
 
-- [roc-lang/basic-cli](https://github.com/roc-lang/basic-cli): pass `Tcp.connect!` and `Random.seed_u64!`. Any platform whose TCP streams have `write!` and `read_exactly!` methods that take a timeout in milliseconds works the same way.
-- [roc-lang/basic-webserver](https://github.com/roc-lang/basic-webserver): its streams take no timeout (the platform gives each operation a fixed 30 seconds), so wrap its dial, `connect!: Client.fixed_timeout(Tcp.connect!)`. It has no random numbers, so pass `random_u64!: || Err(NoRandom)`. That rules out SCRAM logins there, so log in another way, such as trust or md5. The client is then a `Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)`.
+- [roc-lang/basic-cli](https://github.com/roc-lang/basic-cli): pass `connect!: |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(35) })` and `Random.seed_u64!`. The client is a `Client.Client(Tcp.Connection, Schema)`. Any platform whose TCP connections have `write_bytes!` and `read_exactly!` methods works the same way.
+- [roc-lang/basic-webserver](https://github.com/roc-lang/basic-webserver): its connections name their write `write!`, so wrap its dial, `connect!: Client.basic_webserver(Tcp.connect!)`. The platform gives each connect, read and write a fixed 30 seconds. It has no `Duration`, so give the statement timeout as `statement_timeout: Client.millis(25_000)`. It has no random numbers either, so pass `random_u64!: || Err(NoRandom)`. That rules out SCRAM logins there, so log in another way, such as trust or md5. The client is then a `Client.Client(Client.BasicWebserver(Tcp.Connection), Schema)`.
 
 ### Authentication
 
@@ -271,16 +279,18 @@ A login the server asks for that is not listed fails with `AuthMethodNotAllowed(
 
 ### Connection URLs
 
-`Client.connect_url!(url, { connect!: Tcp.connect!, random_u64!: Random.seed_u64! })` connects with a URL like `postgresql://user:password@localhost:6432/app`, and `ConnectionUrl.parse(url)` gives its settings.
+`Client.connect_url!(url, { connect!, random_u64!: Random.seed_u64!, statement_timeout: Duration.seconds(30) })` connects with a URL like `postgresql://user:password@localhost:6432/app`, and `ConnectionUrl.parse(url)` gives its settings.
 
 The syntax is parsed by [roc-database-url](https://github.com/niclas-ahden/roc-database-url). The meaning follows [libpq](https://www.postgresql.org/docs/current/libpq.html): the port defaults to 5432 and the database to the user's name, and `application_name` and the `-c name=value` settings of `options` become session parameters. The connection is plaintext for now (see [TLS](#tls)), which `sslmode` `disable`, `allow` and `prefer` (the default) settle for. `require`, `verify-ca` and `verify-full` demand TLS and are refused with `UnsupportedSslMode(mode)`, and any other option with `UnsupportedOption(name)`, so nothing a URL asks for is silently ignored.
 
 ## Timeouts
 
-We've got two and they're both optional in `Client.connect!` and `Client.connect_url!`:
+There are two, and you set both:
 
-- `statement_timeout_ms`: how long a statement may run before the server cancels it (`PgErr`, SQLSTATE `57014`). The connection stays usable. Off by default, as in Postgres. It is sent as a startup parameter, so it is the session's default, and one transaction can lift it with `set local statement_timeout = 0`. Behind [PgBouncer](https://www.pgbouncer.org) set it on the role instead, see [Web servers](#web-servers).
-- `timeout_ms`: how long the dial and one read or write may wait, the backstop for a server or network that stops answering. The server sends nothing while a statement runs, so it must outlast the longest one. By default 5 seconds more than `statement_timeout_ms`, or 60 seconds without one. Through `Client.fixed_timeout` the platform's own timeout applies instead.
+- `statement_timeout`, a field of `Client.connect!` and `Client.connect_url!`: how long a statement may run before the server cancels it (`PgErr`, SQLSTATE `57014`). The connection stays usable. It is a duration, anything with a `to_millis` method, such as basic-cli's `Duration.seconds(30)`, or `Client.millis(30_000)` on a platform without one. A zero duration turns it off, as in Postgres. It is sent as a startup parameter, so it is the session's default, and one transaction can lift it with `set local statement_timeout = 0`. Behind [PgBouncer](https://www.pgbouncer.org) set it on the role instead, see [Web servers](#web-servers).
+- The connection's own timeout: how long the dial and one read or write may wait, the backstop for a server or network that stops answering. It belongs to the connection, so you set it in your `connect!`, like `io_timeout: Duration.seconds(35)` on basic-cli. basic-webserver gives every connection a fixed 30 seconds.
+
+Make the connection's timeout a few seconds longer than `statement_timeout`. The server sends nothing while a statement runs, so with a shorter one a slow statement breaks the connection with `PgReadErr` before the server gets to cancel it, where it would otherwise fail with `PgErr` and leave the connection usable. `roc-pg` cannot check this for you, since it cannot see the connection's timeout.
 
 ## TLS
 
@@ -295,11 +305,12 @@ A `Client` is one connection, and a connection carries one conversation at a tim
 ```roc
 Context : { host : Str, port : U16, user : Str, database : Str }
 
-Db : Client.Client(Client.FixedTimeout(Tcp.Stream), Schema)
+Db : Client.Client(Client.BasicWebserver(Tcp.Connection), Schema)
 
 with_db! = |{ host, port, user, database }, body!| {
 	db : Db
-	db = Client.connect!({ connect!: Client.fixed_timeout(Tcp.connect!), random_u64!: || Err(NoRandom), host, port, user, database, auth: NoAuth })?
+	# A few seconds under basic-webserver's fixed 30 seconds for each read.
+	db = Client.connect!({ connect!: Client.basic_webserver(Tcp.connect!), random_u64!: || Err(NoRandom), host, port, user, database, auth: NoAuth, statement_timeout: Client.millis(25_000) })?
 	result = body!(db)
 	db.close!()
 	result
@@ -315,7 +326,7 @@ For a busy web server you may want a [PgBouncer](https://www.pgbouncer.org) on t
 
 If you use [PgBouncer](https://www.pgbouncer.org) in transaction mode:
 
-- [PgBouncer](https://www.pgbouncer.org) refuses startup parameters it does not know, so set `statement_timeout` on the role (`alter role my_app set statement_timeout = '30s'`) rather than with `statement_timeout_ms`, and leave settings other than `application_name` out of `params`.
+- [PgBouncer](https://www.pgbouncer.org) refuses startup parameters it does not know, so set `statement_timeout` on the role (`alter role my_app set statement_timeout = '30s'`) and pass a zero `statement_timeout` (`Client.millis(0)`), and leave settings other than `application_name` out of `params`.
 - Named prepared statements (`prepare_unchecked!`) need [PgBouncer](https://www.pgbouncer.org) 1.21 or later with `max_prepared_statements` set. `query!`, `execute!` and the rest use unnamed statements and need nothing.
 - Session state (`set`, session advisory locks, temp tables) does not last from one transaction to the next. Use `set local` inside a transaction.
 

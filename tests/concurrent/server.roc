@@ -7,8 +7,8 @@
 ## one connection at once, their conversations would interleave and a request
 ## would get someone else's number back (or a protocol error).
 ##
-## Its streams take no timeout, so the platform's `connect!` goes through
-## `Client.fixed_timeout`.
+## basic-webserver names its write `write!`, so the platform's `connect!`
+## goes through `Client.basic_webserver`.
 app [Context, program] {
 	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.19.0/4KBAoiBazDfi9UF6e3BYKwon6rA8mnx3dbLMLKFzdEMw.tar.zst",
 	pg: "../../package/main.roc",
@@ -55,7 +55,7 @@ respond! = |request, context| {
 ## Connect, echo `number` back with the session's backend pid, and close.
 echo! = |{ host, port, user, database }, number| {
 	client = Client.connect!({
-		connect!: Client.fixed_timeout(Tcp.connect!),
+		connect!: Client.basic_webserver(Tcp.connect!),
 		# basic-webserver has no random numbers, which only a SCRAM login
 		# needs, and this test logs in with trust.
 		random_u64!: || Err(NoRandom),
@@ -64,6 +64,8 @@ echo! = |{ host, port, user, database }, number| {
 		user,
 		database,
 		auth: NoAuth,
+		# Under the platform's fixed 30 seconds for each read.
+		statement_timeout: Client.millis(25_000),
 		params: [("application_name", "roc-pg-insane-in-the-membrane-concurrent")],
 	})?
 	answer = client.query_one_unchecked!(

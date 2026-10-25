@@ -12,6 +12,7 @@ app [main!] {
 
 import pf.Stdout
 import pf.Tcp
+import pf.Duration
 import pf.Random
 import pf.OsStr
 import pg.Client
@@ -48,9 +49,13 @@ parsed_schema = Catalog.from_schema(schema_sql)
 
 Schema := [].{ catalog = |{}| parsed_schema }
 
-Db : Client.Client(Tcp.Stream, Schema)
+Db : Client.Client(Tcp.Connection, Schema)
 
 Person : { id : I32, name : Str, email : Try(Str, [Null]), tags : List(Str), score : Dec }
+
+## Dial the test server. No statement here runs for long, so five seconds
+## for the dial and each read or write is plenty.
+dial! = |host, port| Tcp.connect!(host, port, { connect_timeout: Duration.seconds(5), io_timeout: Duration.seconds(5) })
 
 check : Str, Bool -> Try({}, [TestFailed(Str)])
 check = |label, ok| if ok Ok({}) else Err(TestFailed(label))
@@ -65,7 +70,7 @@ main! = |args| {
 			}
 			_ => Err(UsageArgs("host port user database"))
 		}?
-	client = Client.connect!({ connect!: Tcp.connect!, random_u64!: Random.seed_u64!, host, port, user, database, auth: NoAuth, timeout_ms: 5000 })?
+	client = Client.connect!({ connect!: dial!, random_u64!: Random.seed_u64!, host, port, user, database, auth: NoAuth, statement_timeout: Duration.zero })?
 	_ = client.execute_unchecked!("drop table if exists typed_people", [])?
 	_ = client.execute_unchecked!("create table typed_people (id integer not null, name text not null, email text, age integer, tags text[] not null, score numeric not null)", [])?
 	# The schema above lacks `name`, as when the database got a column
