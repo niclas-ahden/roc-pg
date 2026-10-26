@@ -267,7 +267,9 @@ expected_errors = [
 ## build does.
 compile_errors! : {} => Try({}, _)
 compile_errors! = |{}| {
-	outcome = Cmd.new(OsStr.from_str("roc")).args(["check", "tests/checked_sql_errors.roc"].map(OsStr.from_str)).run!()
+	# WORKAROUND: --no-cache, see https://github.com/roc-lang/roc/issues/12607.
+	# A cache that has checked the examples and tests can segfault this check.
+	outcome = Cmd.new(OsStr.from_str("roc")).args(["check", "--no-cache", "tests/checked_sql_errors.roc"].map(OsStr.from_str)).run!()
 	output =
 		match outcome {
 			Ok(ran) =>
