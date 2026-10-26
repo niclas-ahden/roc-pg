@@ -28,8 +28,17 @@ main! = |_args| {
 	run!("roc", ["test", "package/main.roc"])?
 
 	Stdout.line!("== check examples and tests")?
+	# WORKAROUND: checking examples/rebellion takes over 16 GB, more than the
+	# runner of the required gate has, see https://github.com/roc-lang/roc/issues/12630.
+	# The gate is the run in the flake's dev shell on GitHub, so only it skips
+	# the check. The optional legs and local runs still make it.
+	in_gate = is_set!("GITHUB_ACTIONS") and is_set!("IN_NIX_SHELL")
 	for file in ["examples/minimal/main.roc", "examples/query.roc", "examples/prepared.roc", "examples/webserver.roc", "examples/small/main.roc", "examples/rebellion/main.roc", "tests/integration.roc", "tests/typed.roc", "tests/concurrent/server.roc"] {
-		check!(file)?
+		if in_gate and file == "examples/rebellion/main.roc" {
+			Stdout.line!("skipped ${file} in the required gate, see roc-lang/roc#12630")?
+		} else {
+			check!(file)?
+		}
 	}
 
 	Stdout.line!("== queries that must not compile")?
@@ -84,6 +93,10 @@ main! = |_args| {
 	concurrent_result?
 	Stdout.line!("all tests passed")
 }
+
+## Whether the environment variable `name` is set.
+is_set! : Str => Bool
+is_set! = |name| Env.var!(OsStr.from_str(name)).is_ok()
 
 ## `roc check` a file. roc exits 2 when it warned but found no errors. A
 ## warning in this repository still fails the check. One in a package roc
