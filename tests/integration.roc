@@ -1068,10 +1068,10 @@ test_startup_last_value_wins! = |server| {
 			.concat(pair("user", server.user))
 			.concat(pair("database", server.database))
 			.append(0)
-	stream.write_bytes!(big_endian_u32(body.len() + 4).concat(body)) ? |_| TestFailed("could not send the startup message")
+	write_bytes!(stream, big_endian_u32(body.len() + 4).concat(body)) ? |_| TestFailed("could not send the startup message")
 	reported = read_startup_replies!(stream, [])?
 	# Terminate, best effort.
-	_ = stream.write_bytes!(['X', 0, 0, 0, 4])
+	_ = write_bytes!(stream, ['X', 0, 0, 0, 4])
 	check("the server logs in as the last user, it reported ${Str.inspect(reported)}", reported.contains(("session_authorization", server.user)))?
 	check("the server takes the last client_encoding, it reported ${Str.inspect(reported)}", reported.contains(("client_encoding", "UTF8")))?
 	Stdout.line!("ok: the server keeps the last value of a startup key")
@@ -1080,14 +1080,21 @@ test_startup_last_value_wins! = |server| {
 big_endian_u32 : U64 -> List(U8)
 big_endian_u32 = |n| [n.shr_zf_wrap(24).to_u8_wrap(), n.shr_zf_wrap(16).to_u8_wrap(), n.shr_zf_wrap(8).to_u8_wrap(), n.to_u8_wrap()]
 
+## The connection's methods, called through functions of our own. Calling them
+## directly and using the connection after an error check frees it in a dev
+## build (roc-lang/roc#12692).
+write_bytes! = |stream, bytes| stream.write_bytes!(bytes)
+
+read_exactly! = |stream, n| stream.read_exactly!(n)
+
 ## Read the server's replies to a startup message through ReadyForQuery and
 ## return the settings it reported (ParameterStatus). An error, such as a
 ## role or database that does not exist, fails the test with its text.
 read_startup_replies! : Tcp.Connection, List((Str, Str)) => Try(List((Str, Str)), _)
 read_startup_replies! = |stream, reported| {
-	header = stream.read_exactly!(5) ? |_| TestFailed("the server closed the connection during the startup")
+	header = read_exactly!(stream, 5) ? |_| TestFailed("the server closed the connection during the startup")
 	len = header.drop_first(1).fold(0, |acc, byte| acc * 256 + byte.to_u64())
-	payload = if len > 4 (stream.read_exactly!(len - 4) ? |_| TestFailed("the server closed the connection during the startup")) else []
+	payload = if len > 4 (read_exactly!(stream, len - 4) ? |_| TestFailed("the server closed the connection during the startup")) else []
 	match header.first() {
 		Ok('Z') => Ok(reported)
 		Ok('E') => Err(TestFailed("the server refused the startup message: ${Str.from_utf8_lossy(payload.map(|byte| if byte == 0 ' ' else byte))}"))
