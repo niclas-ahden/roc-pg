@@ -35,7 +35,7 @@ init! = || {
 	user = Env.var_str!("PG_USER")?
 	database = Env.var_str!("PG_DATABASE")?
 	listen_port = U16.from_str(Env.var_str!("LISTEN_PORT")?)?
-	Ok({ config: Server.default_config.with_listen({ host: "127.0.0.1", port: listen_port }), context: { host, port, user, database } })
+	Ok({ config: Server.with_listen(Server.default_config, { host: "127.0.0.1", port: listen_port }), context: { host, port, user, database } })
 }
 
 respond! : Server.Request, Context => Try(Server.Outcome, [ServerErr(Str)])

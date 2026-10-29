@@ -33,7 +33,7 @@ program = { init!, respond!, shutdown! }
 init! : () => Try({ config : Server.Config, context : Context }, _)
 init! = || {
 	context = { host: "localhost", port: 6432, user: "postgres", database: "postgres" }
-	Ok({ config: Server.default_config.with_listen({ host: "127.0.0.1", port: 8000 }), context })
+	Ok({ config: Server.with_listen(Server.default_config, { host: "127.0.0.1", port: 8000 }), context })
 }
 
 respond! : Server.Request, Context => Try(Server.Outcome, [ServerErr(Str)])
