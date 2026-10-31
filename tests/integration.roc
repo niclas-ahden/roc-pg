@@ -1082,7 +1082,7 @@ big_endian_u32 = |n| [n.shr_zf_wrap(24).to_u8_wrap(), n.shr_zf_wrap(16).to_u8_wr
 
 ## The connection's methods, called through functions of our own. Calling them
 ## directly and using the connection after an error check frees it in a dev
-## build (roc-lang/roc#12692).
+## build, also since roc-lang/roc#12692 was fixed, whose fix does not reach these.
 write_bytes! = |stream, bytes| stream.write_bytes!(bytes)
 
 read_exactly! = |stream, n| stream.read_exactly!(n)

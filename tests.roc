@@ -28,17 +28,8 @@ main! = |_args| {
 	run!("roc", ["test", "package/main.roc"])?
 
 	Stdout.line!("== check examples and tests")?
-	# WORKAROUND: checking examples/rebellion takes over 16 GB, more than the
-	# runner of the required gate has, see https://github.com/roc-lang/roc/issues/12630.
-	# The gate is the run in the flake's dev shell on GitHub, so only it skips
-	# the check. The optional legs and local runs still make it.
-	in_gate = is_set!("GITHUB_ACTIONS") and is_set!("IN_NIX_SHELL")
 	for file in ["examples/minimal/main.roc", "examples/query.roc", "examples/prepared.roc", "examples/webserver.roc", "examples/small/main.roc", "examples/rebellion/main.roc", "tests/integration.roc", "tests/typed.roc", "tests/concurrent/server.roc"] {
-		if in_gate and file == "examples/rebellion/main.roc" {
-			Stdout.line!("skipped ${file} in the required gate, see roc-lang/roc#12630")?
-		} else {
-			check!(file)?
-		}
+		check!(file)?
 	}
 
 	Stdout.line!("== queries that must not compile")?
@@ -94,20 +85,13 @@ main! = |_args| {
 	Stdout.line!("all tests passed")
 }
 
-## Whether the environment variable `name` is set.
-is_set! : Str => Bool
-is_set! = |name| Env.var!(OsStr.from_str(name)).is_ok()
-
 ## `roc check` a file. roc exits 2 when it warned but found no errors. A
 ## warning in this repository still fails the check. One in a package roc
 ## downloaded, like the official basic-webserver warning about its own
 ## files, cannot be fixed here, so it does not.
 check! : Str => Try({}, [Exit(I32)])
 check! = |file| {
-	# WORKAROUND: --no-cache, see https://github.com/roc-lang/roc/issues/12607.
-	# Checking examples/small first leaves the cache in a state where
-	# examples/rebellion's Catalog.from_schema crashes at compile time.
-	output = Cmd.new(OsStr.from_str("roc")).args(["check", "--no-cache", file].map(OsStr.from_str)).stdout(Tee).stderr(Tee).run!() ? |_| Exit(1)
+	output = Cmd.new(OsStr.from_str("roc")).args(["check", file].map(OsStr.from_str)).stdout(Tee).stderr(Tee).run!() ? |_| Exit(1)
 	match output.status {
 		Exited(0) => Ok({})
 		Exited(2) => {
@@ -280,9 +264,7 @@ expected_errors = [
 ## build does.
 compile_errors! : {} => Try({}, _)
 compile_errors! = |{}| {
-	# WORKAROUND: --no-cache, see https://github.com/roc-lang/roc/issues/12607.
-	# A cache that has checked the examples and tests can segfault this check.
-	outcome = Cmd.new(OsStr.from_str("roc")).args(["check", "--no-cache", "tests/checked_sql_errors.roc"].map(OsStr.from_str)).run!()
+	outcome = Cmd.new(OsStr.from_str("roc")).args(["check", "tests/checked_sql_errors.roc"].map(OsStr.from_str)).run!()
 	output =
 		match outcome {
 			Ok(ran) =>
