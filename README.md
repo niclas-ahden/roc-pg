@@ -6,8 +6,8 @@ A PostgreSQL client for Roc that checks every SQL query when the app compiles. W
 
 ```roc
 app [main!] {
-    pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.26.0/GddgvsGjiNXrHFW6au5i5dUDbTs8FinQdrgE2Gqmw53t.tar.zst",
-    pg: "https://github.com/niclas-ahden/roc-pg/releases/download/0.5.1/9LbRCJQYW2JPTC1SuvriB4FrxAxW6JHtZioqQ5Ju1Ur8.tar.zst",
+    pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.0/2yhxoR7cZPSYbyUzPWULFw8AA6QEcdsgFNRmzu7pZbst.tar.zst",
+    pg: "https://github.com/niclas-ahden/roc-pg/releases/download/0.5.2/oG3y9R22fjVHtveXRhsr19P7grwsMxyG1JPsJad1uXB.tar.zst",
 }
 
 import pf.Stdout

@@ -8,7 +8,7 @@
 ## assumed below (adjust it to yours). Run it with `roc examples/webserver.roc`,
 ## then `curl localhost:8000`.
 app [Context, program] {
-	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.19.0/4KBAoiBazDfi9UF6e3BYKwon6rA8mnx3dbLMLKFzdEMw.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.21.0/4viZsnWjdYsyH4Q87ESFAwM5c55Hnc15nAGW1UwzWpFU.tar.zst",
 	pg: "../package/main.roc",
 	http: "https://github.com/roc-lang/http/releases/download/2.0.0/6ZUwqYhCS8PU9Mo6MF7oV82ET2o7KYb57CLKDq4cq4sS.tar.zst",
 }
@@ -33,7 +33,7 @@ program = { init!, respond!, shutdown! }
 init! : () => Try({ config : Server.Config, context : Context }, _)
 init! = || {
 	context = { host: "localhost", port: 6432, user: "postgres", database: "postgres" }
-	Ok({ config: Server.with_listen(Server.default_config, { host: "127.0.0.1", port: 8000 }), context })
+	Ok({ config: Server.default_config.with_listen({ host: "127.0.0.1", port: 8000 }), context })
 }
 
 respond! : Server.Request, Context => Try(Server.Outcome, [ServerErr(Str)])

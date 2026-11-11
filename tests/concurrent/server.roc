@@ -10,7 +10,7 @@
 ## basic-webserver names its write `write!`, so the platform's `connect!`
 ## goes through `Client.basic_webserver`.
 app [Context, program] {
-	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.19.0/4KBAoiBazDfi9UF6e3BYKwon6rA8mnx3dbLMLKFzdEMw.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-webserver/releases/download/0.21.0/4viZsnWjdYsyH4Q87ESFAwM5c55Hnc15nAGW1UwzWpFU.tar.zst",
 	pg: "../../package/main.roc",
 	http: "https://github.com/roc-lang/http/releases/download/2.0.0/6ZUwqYhCS8PU9Mo6MF7oV82ET2o7KYb57CLKDq4cq4sS.tar.zst",
 }
@@ -35,7 +35,7 @@ init! = || {
 	user = Env.var_str!("PG_USER")?
 	database = Env.var_str!("PG_DATABASE")?
 	listen_port = U16.from_str(Env.var_str!("LISTEN_PORT")?)?
-	Ok({ config: Server.with_listen(Server.default_config, { host: "127.0.0.1", port: listen_port }), context: { host, port, user, database } })
+	Ok({ config: Server.default_config.with_listen({ host: "127.0.0.1", port: listen_port }), context: { host, port, user, database } })
 }
 
 respond! : Server.Request, Context => Try(Server.Outcome, [ServerErr(Str)])

@@ -61,7 +61,11 @@ RowFormat := [Text, Nulls, Kinds].{
 	rename_field : RowFormat, Str -> Str
 	rename_field = |_, name| name
 
-	parse_record_start : RowFormat, RowFormat.State -> Try([Counted({ len : U64, rest : RowFormat.State }), Uncounted(RowFormat.State)], [PgDecodeErr(Str)])
+	## A field of the row type that no column filled.
+	missing_field : RowFormat, Str -> RowFormat.Err
+	missing_field = |_, name| MissingRequiredField(name)
+
+	parse_record_start : RowFormat, RowFormat.State -> Try([Counted({ len : U64, rest : RowFormat.State }), Uncounted(RowFormat.State)], RowFormat.Err)
 	parse_record_start = |_, state|
 		if state.started {
 			Err(PgDecodeErr("column ${column_name(state)}: a record field inside a row is not supported"))
@@ -79,7 +83,7 @@ RowFormat := [Text, Nulls, Kinds].{
 			Continue(RowFormat.State),
 			Done(RowFormat.State),
 		],
-		[PgDecodeErr(Str)],
+		RowFormat.Err,
 	)
 	parse_record_field = |format, names, state|
 		match format {
@@ -104,10 +108,10 @@ RowFormat := [Text, Nulls, Kinds].{
 			}
 		}
 
-	parse_record_after_field : RowFormat, RowFormat.State -> Try([Continue(RowFormat.State), Done(RowFormat.State)], [PgDecodeErr(Str)])
+	parse_record_after_field : RowFormat, RowFormat.State -> Try([Continue(RowFormat.State), Done(RowFormat.State)], RowFormat.Err)
 	parse_record_after_field = |_, state| Ok(Continue(state))
 
-	skip_record_field : RowFormat, RowFormat.State -> Try(RowFormat.State, [PgDecodeErr(Str)])
+	skip_record_field : RowFormat, RowFormat.State -> Try(RowFormat.State, RowFormat.Err)
 	skip_record_field = |format, state|
 		match format {
 			Text => Ok(advance(state))
@@ -115,7 +119,7 @@ RowFormat := [Text, Nulls, Kinds].{
 		}
 
 	## `Try(T, [Null])` asks this first. `Err` means "not NULL, read a `T`".
-	parse_null : RowFormat, RowFormat.State -> Try(RowFormat.State, [PgDecodeErr(Str)])
+	parse_null : RowFormat, RowFormat.State -> Try(RowFormat.State, RowFormat.Err)
 	parse_null = |format, state|
 		match format {
 			Text =>
@@ -135,7 +139,7 @@ RowFormat := [Text, Nulls, Kinds].{
 		}
 
 	## Arrays. Reading a shape, one element is enough to learn its type.
-	parse_list_start : RowFormat, RowFormat.State -> Try([Counted({ len : U64, rest : RowFormat.State }), Uncounted(RowFormat.State)], [PgDecodeErr(Str)])
+	parse_list_start : RowFormat, RowFormat.State -> Try([Counted({ len : U64, rest : RowFormat.State }), Uncounted(RowFormat.State)], RowFormat.Err)
 	parse_list_start = |format, state|
 		match format {
 			Text => {
@@ -150,20 +154,20 @@ RowFormat := [Text, Nulls, Kinds].{
 			Nulls | Kinds => Ok(Counted({ len: 1, rest: { ..state, in_list: Bool.True } }))
 		}
 
-	parse_list_next : RowFormat, RowFormat.State -> Try([Item(RowFormat.State), Done(RowFormat.State)], [PgDecodeErr(Str)])
+	parse_list_next : RowFormat, RowFormat.State -> Try([Item(RowFormat.State), Done(RowFormat.State)], RowFormat.Err)
 	parse_list_next = |_, state| Ok(Done(state))
 
-	parse_list_after_item : RowFormat, RowFormat.State -> Try([Continue(RowFormat.State), Done(RowFormat.State)], [PgDecodeErr(Str)])
+	parse_list_after_item : RowFormat, RowFormat.State -> Try([Continue(RowFormat.State), Done(RowFormat.State)], RowFormat.Err)
 	parse_list_after_item = |_, state| Ok(Done(state))
 
-	parse_str : RowFormat, RowFormat.State -> Try({ value : Str, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_str : RowFormat, RowFormat.State -> Try({ value : Str, rest : RowFormat.State }, RowFormat.Err)
 	parse_str = |format, state|
 		match format {
 			Text => current_text(state, "a Str")
 			_ => Ok({ value: "", rest: kind(state, "Str") })
 		}
 
-	parse_bool : RowFormat, RowFormat.State -> Try({ value : Bool, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_bool : RowFormat, RowFormat.State -> Try({ value : Bool, rest : RowFormat.State }, RowFormat.Err)
 	parse_bool = |format, state|
 		match format {
 			Text => {
@@ -179,41 +183,41 @@ RowFormat := [Text, Nulls, Kinds].{
 			_ => Ok({ value: Bool.False, rest: kind(state, "Bool") })
 		}
 
-	parse_u8 : RowFormat, RowFormat.State -> Try({ value : U8, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_u8 : RowFormat, RowFormat.State -> Try({ value : U8, rest : RowFormat.State }, RowFormat.Err)
 	parse_u8 = |format, state| number(format, state, "U8", "a U8", U8.from_str, 0)
 
-	parse_u16 : RowFormat, RowFormat.State -> Try({ value : U16, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_u16 : RowFormat, RowFormat.State -> Try({ value : U16, rest : RowFormat.State }, RowFormat.Err)
 	parse_u16 = |format, state| number(format, state, "U16", "a U16", U16.from_str, 0)
 
-	parse_u32 : RowFormat, RowFormat.State -> Try({ value : U32, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_u32 : RowFormat, RowFormat.State -> Try({ value : U32, rest : RowFormat.State }, RowFormat.Err)
 	parse_u32 = |format, state| number(format, state, "U32", "a U32", U32.from_str, 0)
 
-	parse_u64 : RowFormat, RowFormat.State -> Try({ value : U64, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_u64 : RowFormat, RowFormat.State -> Try({ value : U64, rest : RowFormat.State }, RowFormat.Err)
 	parse_u64 = |format, state| number(format, state, "U64", "a U64", U64.from_str, 0)
 
-	parse_i8 : RowFormat, RowFormat.State -> Try({ value : I8, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_i8 : RowFormat, RowFormat.State -> Try({ value : I8, rest : RowFormat.State }, RowFormat.Err)
 	parse_i8 = |format, state| number(format, state, "I8", "an I8", I8.from_str, 0)
 
-	parse_i16 : RowFormat, RowFormat.State -> Try({ value : I16, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_i16 : RowFormat, RowFormat.State -> Try({ value : I16, rest : RowFormat.State }, RowFormat.Err)
 	parse_i16 = |format, state| number(format, state, "I16", "an I16", I16.from_str, 0)
 
-	parse_i32 : RowFormat, RowFormat.State -> Try({ value : I32, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_i32 : RowFormat, RowFormat.State -> Try({ value : I32, rest : RowFormat.State }, RowFormat.Err)
 	parse_i32 = |format, state| number(format, state, "I32", "an I32", I32.from_str, 0)
 
-	parse_i64 : RowFormat, RowFormat.State -> Try({ value : I64, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_i64 : RowFormat, RowFormat.State -> Try({ value : I64, rest : RowFormat.State }, RowFormat.Err)
 	parse_i64 = |format, state| number(format, state, "I64", "an I64", I64.from_str, 0)
 
-	parse_dec : RowFormat, RowFormat.State -> Try({ value : Dec, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_dec : RowFormat, RowFormat.State -> Try({ value : Dec, rest : RowFormat.State }, RowFormat.Err)
 	parse_dec = |format, state| number(format, state, "Dec", "a Dec", PgResult.dec_from_text, 0)
 
 	## A [Numeric] field, which no format of Roc's own reads.
-	parse_numeric : RowFormat, RowFormat.State -> Try({ value : Numeric, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_numeric : RowFormat, RowFormat.State -> Try({ value : Numeric, rest : RowFormat.State }, RowFormat.Err)
 	parse_numeric = |format, state| number(format, state, "Numeric", "a Numeric", Numeric.from_str, Numeric.from_i128(0))
 
-	parse_f32 : RowFormat, RowFormat.State -> Try({ value : F32, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_f32 : RowFormat, RowFormat.State -> Try({ value : F32, rest : RowFormat.State }, RowFormat.Err)
 	parse_f32 = |format, state| number(format, state, "F32", "an F32", F32.from_str, 0)
 
-	parse_f64 : RowFormat, RowFormat.State -> Try({ value : F64, rest : RowFormat.State }, [PgDecodeErr(Str)])
+	parse_f64 : RowFormat, RowFormat.State -> Try({ value : F64, rest : RowFormat.State }, RowFormat.Err)
 	parse_f64 = |format, state| number(format, state, "F64", "an F64", F64.from_str, 0)
 }
 
