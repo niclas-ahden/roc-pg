@@ -1091,9 +1091,9 @@ read_exactly! = |stream, n| stream.read_exactly!(n)
 ## return the settings it reported (ParameterStatus). An error, such as a
 ## role or database that does not exist, fails the test with its text.
 ##
-## WORKAROUND: the error type is written out. Left as `_`, roc 4b7b125
-## crashes in Boxy lowering on this recursive function, since its error
-## carries a payload. Back to `_` once that is fixed.
+## WORKAROUND: roc-lang/roc#12984. The error type is written out, since
+## left as `_` roc crashes in Boxy lowering on this recursive function, whose
+## error carries a payload. Back to `_` once that is fixed.
 read_startup_replies! : Tcp.Connection, List((Str, Str)) => Try(List((Str, Str)), [TestFailed(Str)])
 read_startup_replies! = |stream, reported| {
 	header = read_exactly!(stream, 5) ? |_| TestFailed("the server closed the connection during the startup")
