@@ -53,7 +53,7 @@ Sql(schema, params, row) :: { text : Str, params : List(Str), unverified : List(
 		param_fields = RowFormat.shape(Params.parser_for(RowFormat.Nulls), Params.parser_for(RowFormat.Kinds)) ? |_| BadQuotedBytes("a field of the parameter record is a record, which is no parameter")
 		row_fields = RowFormat.shape(Row.parser_for(RowFormat.Nulls), Row.parser_for(RowFormat.Kinds)) ? |_| BadQuotedBytes("a field of the row type is a record, which a result row cannot fill")
 		match Schema.catalog({}).check(raw, param_fields, row_fields) {
-			Ok({ text, params: names, unverified }) => Ok(Sql.{ text, params: names, unverified, fields: row_fields })
+			Ok({ text: checked_text, params: names, unverified: unverified_names }) => Ok(Sql.{ text: checked_text, params: names, unverified: unverified_names, fields: row_fields })
 			Err(message) => Err(BadQuotedBytes(message))
 		}
 	}

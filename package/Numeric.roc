@@ -44,11 +44,11 @@ Numeric :: { negative : Bool, digits : List(U8), scale : U64 }.{
 			return Err(BadNumStr)
 		}
 		all = whole.concat(fraction)
-		scale = fraction.len().to_i64_wrap() - exponent
-		if scale >= 0 {
-			Ok(normal(negative, all, scale.to_u64_wrap()))
+		point_scale = fraction.len().to_i64_wrap() - exponent
+		if point_scale >= 0 {
+			Ok(normal(negative, all, point_scale.to_u64_wrap()))
 		} else {
-			Ok(normal(negative, all.concat(List.repeat(0, (-scale).to_u64_wrap())), 0))
+			Ok(normal(negative, all.concat(List.repeat(0, (-point_scale).to_u64_wrap())), 0))
 		}
 	}
 

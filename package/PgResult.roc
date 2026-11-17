@@ -45,8 +45,8 @@ PgResult :: {
 		str = |row, name|
 			match Row.raw(row, name)? {
 				Null => Err(UnexpectedNull(name))
-				Present(bytes) =>
-					match Str.from_utf8(bytes) {
+				Present(utf8) =>
+					match Str.from_utf8(utf8) {
 						Ok(value) => Ok(value)
 						Err(_) => Err(BadUtf8(name))
 					}
@@ -57,8 +57,8 @@ PgResult :: {
 		str_nullable = |row, name|
 			match Row.raw(row, name)? {
 				Null => Ok(Null)
-				Present(bytes) =>
-					match Str.from_utf8(bytes) {
+				Present(utf8) =>
+					match Str.from_utf8(utf8) {
 						Ok(value) => Ok(Present(value))
 						Err(_) => Err(BadUtf8(name))
 					}
@@ -281,7 +281,7 @@ PgResult :: {
 	## result = PgResult.new(["id", "name"], [[Present("7".to_utf8()), Null]], "SELECT 1")
 	## ```
 	new : List(Str), List(List([Null, Present(List(U8))])), Str -> PgResult
-	new = |columns, raw_rows, command_tag| { columns, raw_rows, command_tag }
+	new = |columns, raw_rows, tag| { columns, raw_rows, command_tag: tag }
 
 	## The rows as the server sent them: `Null` or the text of each value, in
 	## column order. Checked queries decode them with their row type.

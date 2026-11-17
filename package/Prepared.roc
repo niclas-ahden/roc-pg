@@ -14,7 +14,7 @@ Prepared :: {
 	columns : List(ProtoBackend.Column),
 }.{
 	new : { name : Str, sql : Str, prepared_on : [Pending, Known(ProtoBackend.KeyData)], columns : List(ProtoBackend.Column) } -> Prepared
-	new = |{ name, sql, prepared_on, columns }| { name, sql, prepared_on, columns }
+	new = |{ name: given_name, sql: given_sql, prepared_on: given_prepared_on, columns: given_columns }| { name: given_name, sql: given_sql, prepared_on: given_prepared_on, columns: given_columns }
 
 	name : Prepared -> Str
 	name = |prepared| prepared.name
