@@ -10,7 +10,7 @@
 ## basic-webserver names its write `write!`, so the platform's `connect!`
 ## goes through `Client.basic_webserver`.
 app [Context, program] {
-	pf: platform "https://github.com/niclas-ahden/basic-webserver/releases/download/0.22.0/7NxsjTDPycgHvrQCAMgmonvf9u4gjpLC9LhEAKZRzA8P.tar.zst",
+	pf: platform "https://github.com/niclas-ahden/basic-webserver/releases/download/0.24.0/AmhZCQsTsZGNyLT6XgN8Z7wqDtCGn22FnSDoqzeF8Z61.tar.zst",
 	pg: "../../package/main.roc",
 	http: "https://github.com/roc-lang/http/releases/download/2.0.0/6ZUwqYhCS8PU9Mo6MF7oV82ET2o7KYb57CLKDq4cq4sS.tar.zst",
 }
