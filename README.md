@@ -6,8 +6,8 @@ A PostgreSQL client for Roc that checks every SQL query when the app compiles. W
 
 ```roc
 app [main!] {
-    pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.0/2yhxoR7cZPSYbyUzPWULFw8AA6QEcdsgFNRmzu7pZbst.tar.zst",
-    pg: "https://github.com/niclas-ahden/roc-pg/releases/download/0.5.2/oG3y9R22fjVHtveXRhsr19P7grwsMxyG1JPsJad1uXB.tar.zst",
+    pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.1/7brgwR8YUqfeGrkdfF1V4GPPN7DnP7ftqub9KcrTEZtr.tar.zst",
+    pg: "https://github.com/niclas-ahden/roc-pg/releases/download/0.5.3/GHArBE4QrXKDpttdxtb8GQWXZWhWSuMBgA73qRoETm8r.tar.zst",
 }
 
 import pf.Stdout
@@ -18,12 +18,12 @@ import pg.Client
 import pg.Catalog
 import "schema.sql" as schema_sql : Str
 
-catalog : Catalog
-catalog = Catalog.from_schema(schema_sql)
+schema_catalog : Catalog
+schema_catalog = Catalog.from_schema(schema_sql)
 
 Schema := [].{
     catalog : {} -> Catalog
-    catalog = |{}| catalog
+    catalog = |{}| schema_catalog
 }
 
 main! = |_| {

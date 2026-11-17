@@ -8,7 +8,7 @@
 ## `none` only reads and decodes the file, so the difference to it is the
 ## lexing.
 app [main!] {
-	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.0/2yhxoR7cZPSYbyUzPWULFw8AA6QEcdsgFNRmzu7pZbst.tar.zst",
+	pf: platform "https://github.com/roc-lang/basic-cli/releases/download/0.28.1/7brgwR8YUqfeGrkdfF1V4GPPN7DnP7ftqub9KcrTEZtr.tar.zst",
 	pg: "../package/internals.roc",
 }
 
